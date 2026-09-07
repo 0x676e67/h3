@@ -59,11 +59,7 @@ fn run_child(role: ChildRole, args: impl Iterator<Item = OsString>) -> Result<i3
         ChildRole::Client(Http3Library::Nghttp3) => {
             bench::run_nghttp3_client(args).context("nghttp3 benchmark client failed")
         }
-        ChildRole::Server => {
-            bench::run_server(string_args(args)?.into_iter())
-                .context("HTTP/3 benchmark server failed")?;
-            Ok(0)
-        }
+        ChildRole::Server => bench::run_server(args).context("nghttp3 benchmark server failed"),
     }
 }
 

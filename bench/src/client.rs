@@ -18,7 +18,7 @@ use tokio::{
 
 use super::{
     case::{ALPN_H3, SERVER_ADDR, SERVER_NAME, workspace_root},
-    headers::{HeaderMode, REQUEST_HEADERS, RESPONSE_HEADERS},
+    headers::{Directions, REQUEST_HEADERS, RESPONSE_HEADERS},
     result::{ClientResult, MEASUREMENT_PROFILE, RESULT_SCHEMA},
 };
 
@@ -39,13 +39,14 @@ pub trait Adapter: Send + 'static {
 
     fn connect(
         connection: quinn::Connection,
+        qpack: Directions,
     ) -> impl Future<Output = Result<ReadyConnection<Self::Sender>>> + Send;
 
     fn send_request(
         sender: &mut Self::Sender,
         request_uri: Uri,
         expected_body_size: usize,
-        headers: HeaderMode,
+        headers: Directions,
     ) -> impl Future<Output = Result<()>> + Send;
 }
 
@@ -57,12 +58,19 @@ pub fn run_from_args<A: Adapter>(mut args: impl Iterator<Item = String>) -> Resu
     let headers = args
         .next()
         .context("missing header mode")?
-        .parse::<HeaderMode>()?;
+        .parse::<Directions>()?;
+    let qpack = args
+        .next()
+        .context("missing QPACK mode")?
+        .parse::<Directions>()?;
     if in_flight > requests {
         bail!("in-flight requests cannot exceed total requests");
     }
     if let Some(extra) = args.next() {
         bail!("unexpected internal client argument {extra:?}");
+    }
+    if A::HTTP3_LIBRARY == "h3" && (qpack.request || qpack.response) {
+        bail!("h3 only supports qpack=none in this benchmark");
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -73,6 +81,7 @@ pub fn run_from_args<A: Adapter>(mut args: impl Iterator<Item = String>) -> Resu
         expected_body_size,
         in_flight,
         headers,
+        qpack,
     ))?;
 
     println!("{}", serde_json::to_string(&result)?);
@@ -83,7 +92,8 @@ async fn run_client<A: Adapter>(
     requests: usize,
     expected_body_size: usize,
     in_flight: usize,
-    headers: HeaderMode,
+    headers: Directions,
+    qpack: Directions,
 ) -> Result<ClientResult> {
     let expected_bytes = requests
         .checked_mul(expected_body_size)
@@ -92,7 +102,11 @@ async fn run_client<A: Adapter>(
     let client_config = client_config()?;
     let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse()?)?;
     endpoint.set_default_client_config(client_config);
-    let connection = connect::<A>(&endpoint).await?;
+    // Reusable setup (runtime, trust store, TLS configuration and UDP endpoint)
+    // is excluded. Include this connection's TLS/QUIC handshake and HTTP/3 setup,
+    // followed by all requests, through the last fully validated response.
+    let benchmark_started = Instant::now();
+    let connection = connect::<A>(&endpoint, qpack).await?;
     let driver = connection.driver;
     let quic_connection = connection.quic_connection;
     let sender_guard = connection.sender;
@@ -122,9 +136,10 @@ async fn run_client<A: Adapter>(
             .await
             .context("request workers exited before reaching the start barrier")?;
     }
-    // Profiling snapshots stay outside the request timer and are opt-in.
+    // Opt-in profiling snapshots delimit request-only transport counters. They
+    // occur after setup inside this connection-inclusive timer; profile-mode
+    // timings are diagnostic, not the throughput comparison.
     let stats_before = std::env::var_os("HTTP3_BENCH_QUINN_STATS").map(|_| quic_connection.stats());
-    let benchmark_started = Instant::now();
     start_tx
         .send(true)
         .context("request workers exited before the benchmark started")?;
@@ -158,6 +173,7 @@ async fn run_client<A: Adapter>(
     Ok(ClientResult {
         schema: RESULT_SCHEMA.to_owned(),
         http3_library: A::HTTP3_LIBRARY.to_owned(),
+        qpack: qpack.to_string(),
         quic_backend: "quinn".to_owned(),
         transport_profile: "quinn-default-pmtud".to_owned(),
         measurement_profile: MEASUREMENT_PROFILE.to_owned(),
@@ -190,6 +206,9 @@ fn client_config() -> Result<quinn::ClientConfig> {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
     provider.cipher_suites =
         vec![rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256];
+    // Handshakes are timed: match the native peers instead of inheriting a
+    // different classical/post-quantum preference from each TLS provider.
+    provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519];
     let mut tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_root_certificates(roots)
@@ -201,7 +220,10 @@ fn client_config() -> Result<quinn::ClientConfig> {
     )))
 }
 
-async fn connect<A: Adapter>(endpoint: &quinn::Endpoint) -> Result<ReadyConnection<A::Sender>> {
+async fn connect<A: Adapter>(
+    endpoint: &quinn::Endpoint,
+    qpack: Directions,
+) -> Result<ReadyConnection<A::Sender>> {
     let server_addr: SocketAddr = SERVER_ADDR.parse()?;
     let connection = endpoint.connect(server_addr, SERVER_NAME)?.await?;
     let handshake = connection
@@ -212,14 +234,14 @@ async fn connect<A: Adapter>(endpoint: &quinn::Endpoint) -> Result<ReadyConnecti
     if handshake.protocol.as_deref() != Some(ALPN_H3) {
         bail!("TLS did not negotiate h3: {:?}", handshake.protocol);
     }
-    A::connect(connection).await
+    A::connect(connection, qpack).await
 }
 
 async fn run_request_worker<A: Adapter>(
     mut sender: A::Sender,
     assigned_requests: usize,
     expected_body_size: usize,
-    headers: HeaderMode,
+    headers: Directions,
     prepared: mpsc::Sender<()>,
     mut start: watch::Receiver<bool>,
 ) -> Result<Instant> {
@@ -275,6 +297,23 @@ fn duration_ns(duration: Duration) -> Result<u64> {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! client_adapter {
+    (@configure http3, $builder:ident, $qpack:ident) => {
+        if $qpack.request {
+            $builder.qpack_encoder_table_capacity($crate::case::QPACK_TABLE_CAPACITY);
+        }
+        if $qpack.response {
+            $builder
+                .qpack_max_table_capacity(u64::try_from($crate::case::QPACK_TABLE_CAPACITY)?)
+                .qpack_blocked_streams($crate::case::QPACK_BLOCKED_STREAMS);
+        }
+    };
+    (@configure h3, $builder:ident, $qpack:ident) => {
+        // The fixed upstream revision only wires stateless QPACK into its Client.
+        // Running a dynamic case anyway would silently measure a different mode.
+        if $qpack.request || $qpack.response {
+            anyhow::bail!("h3 only supports qpack=none in this benchmark");
+        }
+    };
     ($adapter:ident, $http3_crate:ident, $transport:ident, $library:literal) => {
         struct $adapter;
 
@@ -285,10 +324,12 @@ macro_rules! client_adapter {
 
             async fn connect(
                 connection: quinn::Connection,
+                qpack: $crate::headers::Directions,
             ) -> anyhow::Result<$crate::client::ReadyConnection<Self::Sender>> {
                 let quic_connection = connection.clone();
                 let mut builder = $http3_crate::client::builder();
                 builder.send_grease(false);
+                $crate::client_adapter!(@configure $http3_crate, builder, qpack);
                 let (mut connection, sender) = builder
                     .build($transport::Connection::new(connection))
                     .await?;
@@ -311,7 +352,7 @@ macro_rules! client_adapter {
                 sender: &mut Self::Sender,
                 request_uri: http::Uri,
                 expected_body_size: usize,
-                headers: $crate::headers::HeaderMode,
+                headers: $crate::headers::Directions,
             ) -> anyhow::Result<()> {
                 use anyhow::Context as _;
                 use bytes::Buf as _;

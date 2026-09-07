@@ -11,6 +11,9 @@ use std::{
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/native/client.c");
+    println!("cargo:rerun-if-changed=src/native/server.c");
+    println!("cargo:rerun-if-changed=src/native/nghttp3.c");
+    println!("cargo:rerun-if-changed=src/native/native.h");
     println!("cargo:rerun-if-changed=src/headers.txt");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS")?;
@@ -42,6 +45,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut build = cc::Build::new();
     build
         .file("src/native/client.c")
+        .file("src/native/server.c")
+        .file("src/native/nghttp3.c")
         .include(&output)
         .include(required_path("DEP_NGTCP2_INCLUDE")?)
         .include(required_path("DEP_NGHTTP3_INCLUDE")?)
@@ -68,7 +73,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .flag_if_supported("-std=c11");
     }
 
-    build.compile("http3_bench_nghttp3_client");
+    build.compile("http3_bench_nghttp3");
 
     if target_os == "windows" {
         for library in ["ws2_32", "bcrypt", "crypt32", "advapi32", "userenv"] {
@@ -149,7 +154,9 @@ fn generate_headers(output: &Path) -> Result<(), Box<dyn Error>> {
             fields.len()
         )?;
         writeln!(native, "#define {name}_LEN {}", fields.len())?;
-        writeln!(native, "static const benchmark_header {name}[] = {{")?;
+        // One translation unit defines the shared fixture; the others borrow it.
+        writeln!(native, "#ifdef HTTP3_BENCH_DEFINE_HEADERS")?;
+        writeln!(native, "const benchmark_header {name}[] = {{")?;
         for (field, value) in fields {
             writeln!(
                 rust,
@@ -158,7 +165,9 @@ fn generate_headers(output: &Path) -> Result<(), Box<dyn Error>> {
             writeln!(native, "  {{{field:?}, {value:?}}},")?;
         }
         rust.push_str("];\n");
-        native.push_str("};\n");
+        writeln!(native, "}};\n#else")?;
+        writeln!(native, "extern const benchmark_header {name}[{name}_LEN];")?;
+        native.push_str("#endif\n");
     }
     fs::write(output.join("headers.rs"), rust)?;
     fs::write(output.join("headers.h"), native)?;

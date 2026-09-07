@@ -2,7 +2,7 @@
 
 use std::{
     ffi::OsStr,
-    io::{BufRead, BufReader},
+    io::{self, BufRead, BufReader, Read},
     path::Path,
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc,
@@ -13,10 +13,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 use bench::{
     case::{
-        Case, Http3Library, MAX_BODY_BYTES, SERVER_ADDR, SERVER_MAX_BIDI_STREAMS, SERVER_WORKERS,
-        workspace_root,
+        Case, Http3Library, MAX_BODY_BYTES, SERVER_ADDR, SERVER_MAX_BIDI_STREAMS, workspace_root,
     },
-    result::ClientResult,
+    result::{ClientResult, ServerResult},
 };
 use wait_timeout::ChildExt;
 
@@ -120,6 +119,7 @@ impl ClientRunner<'_> {
             .arg(case.body_bytes.to_string())
             .arg(case.in_flight.to_string())
             .arg(case.headers.to_string())
+            .arg(case.qpack.to_string())
             .current_dir(workspace_root())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -175,19 +175,20 @@ impl ClientRunner<'_> {
 pub(crate) struct ServerGuard {
     child: Child,
     stdin: Option<ChildStdin>,
+    output: Option<thread::JoinHandle<io::Result<String>>>,
 }
 
 impl ServerGuard {
-    pub(crate) fn start(executable: &Path, case: Case, library: Http3Library) -> Result<Self> {
+    pub(crate) fn start(executable: &Path, case: Case) -> Result<Self> {
         let body_bytes = case.body_bytes;
         let headers = case.headers;
         let mut child = ChildCleanupGuard {
             child: Some(
                 ChildRole::Server
                     .command(executable)
-                    .arg(library.name())
                     .arg(body_bytes.to_string())
                     .arg(headers.to_string())
+                    .arg(case.qpack.to_string())
                     .current_dir(workspace_root())
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
@@ -208,10 +209,17 @@ impl ServerGuard {
             .take()
             .context("benchmark server stdout was not captured")?;
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        thread::spawn(move || {
+        let output = thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
             let mut line = String::new();
-            let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
+            let result = reader.read_line(&mut line).map(|_| line);
             let _ = ready_tx.send(result);
+            // Keep draining after READY. The final summary proves both the
+            // completed workload and actual dynamic references on this Server;
+            // closing stdout after READY would lose that evidence (or SIGPIPE).
+            let mut summary = String::new();
+            reader.read_to_string(&mut summary)?;
+            Ok(summary)
         });
 
         let ready = match ready_rx.recv_timeout(SERVER_READY_TIMEOUT) {
@@ -222,10 +230,11 @@ impl ServerGuard {
             }
         };
         let expected = format!(
-            "http3-bench-server-v6 library={library} address={SERVER_ADDR} body_bytes={body_bytes} \
-             headers={headers} \
-             max_concurrent_bidi_streams={SERVER_MAX_BIDI_STREAMS} transport=quinn \
-             runtime=pingora-no-steal workers={SERVER_WORKERS}"
+            "http3-bench-server-v7 library=nghttp3 address={SERVER_ADDR} body_bytes={body_bytes} \
+             headers={headers} qpack={} \
+             max_concurrent_bidi_streams={SERVER_MAX_BIDI_STREAMS} transport=ngtcp2 \
+             runtime=native workers=1",
+            case.qpack
         );
         if ready.trim() != expected {
             let status = child
@@ -241,10 +250,11 @@ impl ServerGuard {
         Ok(Self {
             child: child.into_child()?,
             stdin: Some(stdin),
+            output: Some(output),
         })
     }
 
-    pub(crate) fn finish(&mut self) -> Result<()> {
+    pub(crate) fn finish(&mut self, case: Case, expected_requests: u64) -> Result<()> {
         self.stdin.take();
         let Some(status) = self
             .child
@@ -261,6 +271,19 @@ impl ServerGuard {
         if !status.success() {
             bail!("benchmark server exited with {status}");
         }
+        let stdout = self
+            .output
+            .take()
+            .context("server output was already consumed")?
+            .join()
+            .map_err(|_| anyhow::anyhow!("server output reader failed"))??;
+        let result: ServerResult =
+            serde_json::from_str(stdout.trim()).context("invalid native Server summary")?;
+        result.validate(case, expected_requests)?;
+        eprintln!(
+            "nghttp3 Server: {} requests; dynamic field sections: request={}, response={}",
+            result.requests, result.request_dynamic_sections, result.response_dynamic_sections
+        );
         Ok(())
     }
 }
@@ -278,6 +301,9 @@ impl Drop for ServerGuard {
             let _ = self.child.kill();
         }
         let _ = self.child.wait();
+        if let Some(output) = self.output.take() {
+            let _ = output.join();
+        }
     }
 }
 

@@ -4,8 +4,8 @@ use std::{env, path::Path};
 
 use anyhow::{Context, Result, bail};
 use bench::{
-    case::{Case, DEFAULT_BODY_BYTES, Http3Library, MAX_BODY_BYTES, MAX_REQUESTS, SERVER_WORKERS},
-    headers::HeaderMode,
+    case::{Case, DEFAULT_BODY_BYTES, Http3Library, MAX_BODY_BYTES, MAX_REQUESTS},
+    headers::Directions,
 };
 use bytesize::ByteSize;
 use criterion::{BenchmarkId, Criterion, SamplingMode, Throughput};
@@ -16,6 +16,7 @@ const BODY_SIZES_ENV: &str = "HTTP3_BENCH_BODY_SIZES";
 const REQUESTS_ENV: &str = "HTTP3_BENCH_REQUESTS";
 const CONCURRENCY_ENV: &str = "HTTP3_BENCH_CONCURRENCY";
 const HEADERS_ENV: &str = "HTTP3_BENCH_HEADERS";
+const QPACK_ENV: &str = "HTTP3_BENCH_QPACK";
 const MAX_CONCURRENCY: usize = 100;
 const BANDWIDTH_BODY_THRESHOLD: usize = 64 * 1024;
 const TEST_REQUESTS: usize = 4;
@@ -25,7 +26,8 @@ struct Config {
     cases: Vec<Case>,
     requests: Option<usize>,
     concurrency: Option<usize>,
-    headers: HeaderMode,
+    headers: Directions,
+    qpack: Vec<Directions>,
     test_mode: bool,
     sample_size_from_cli: bool,
     measurement_time_from_cli: bool,
@@ -61,12 +63,18 @@ impl Config {
             Err(error) => return Err(error).context("could not read benchmark concurrency"),
         };
         let headers = match env::var(HEADERS_ENV) {
-            Ok(value) => value.parse::<HeaderMode>()?,
-            Err(env::VarError::NotPresent) => HeaderMode {
+            Ok(value) => value.parse::<Directions>()?,
+            Err(env::VarError::NotPresent) => Directions {
                 request: true,
                 response: true,
             },
             Err(error) => return Err(error).context("could not read header mode"),
+        };
+        let qpack = match env::var(QPACK_ENV) {
+            Ok(value) if value == "all" => Directions::ALL.to_vec(),
+            Ok(value) => vec![value.parse::<Directions>()?],
+            Err(env::VarError::NotPresent) => Directions::ALL.to_vec(),
+            Err(error) => return Err(error).context("could not read QPACK mode"),
         };
 
         Ok(Self {
@@ -74,6 +82,7 @@ impl Config {
             requests,
             concurrency,
             headers,
+            qpack,
             test_mode: criterion_arg_present("--test"),
             sample_size_from_cli: criterion_arg_present("--sample-size"),
             measurement_time_from_cli: criterion_arg_present("--measurement-time"),
@@ -108,6 +117,7 @@ fn run_groups(criterion: &mut Criterion, config: &Config, executable: &Path) -> 
                     requests: TEST_REQUESTS,
                     in_flight: TEST_IN_FLIGHT,
                     headers: config.headers,
+                    qpack: default_case.qpack,
                 }
             } else {
                 Case {
@@ -146,17 +156,28 @@ fn run_groups(criterion: &mut Criterion, config: &Config, executable: &Path) -> 
         },
     ];
 
-    for &case in &cases {
-        // Keep both Server stacks in the same run, with identical Client code
-        // and workloads. A shared-code optimization can affect both endpoints;
-        // the fixed upstream Server helps distinguish that from Client changes.
-        for server_library in [Http3Library::Http3, Http3Library::H3] {
+    for &default_case in &cases {
+        // One fixed native Server removes shared Rust HTTP/3 implementation
+        // changes from the opposite endpoint. Header workload and dynamic-table
+        // policy are independent: enabling a table need not yield a reference
+        // when every field already has an exact static-table representation.
+        for &qpack in &config.qpack {
+            let case = Case {
+                qpack,
+                ..default_case
+            };
             for runner in &runners {
                 let library = runner.library;
-                // Do not compare against historical work-stealing Server baselines implicitly.
-                let mut group = criterion.benchmark_group(format!(
-                    "{library}/{case}/server-{server_library}-no-steal-{SERVER_WORKERS}"
-                ));
+                if library == Http3Library::H3 && (qpack.request || qpack.response) {
+                    eprintln!(
+                        "h3: skipping qpack={qpack}; fixed upstream supports stateless QPACK only"
+                    );
+                    continue;
+                }
+                // v2 measures connection establishment too; never overwrite the
+                // v1 post-setup results or the previous Rust Server baselines.
+                let mut group =
+                    criterion.benchmark_group(format!("{library}/{case}/server-nghttp3-native-2"));
                 group.sampling_mode(SamplingMode::Flat);
                 if !config.test_mode && !config.sample_size_from_cli {
                     group.sample_size(10);
@@ -167,27 +188,34 @@ fn run_groups(criterion: &mut Criterion, config: &Config, executable: &Path) -> 
                 group.throughput(throughput(case)?);
 
                 let mut server = None;
+                let mut completed_requests = 0_u64;
                 let benchmark_id = BenchmarkId::from_parameter(format!(
                     // Browser templates are a different workload from historical repeated fields.
-                    "requests-{}/concurrency-{}/headers-{}",
-                    case.requests, case.in_flight, case.headers,
+                    "requests-{}/concurrency-{}/headers-{}/qpack-{}",
+                    case.requests, case.in_flight, case.headers, case.qpack,
                 ));
                 group.bench_with_input(benchmark_id, &case, |bencher, &case| {
                     server.get_or_insert_with(|| {
-                    ServerGuard::start(executable, case, server_library).unwrap_or_else(|error| {
-                        panic!("could not start {server_library} server for {library}: {error:#}")
-                    })
-                });
+                        ServerGuard::start(executable, case).unwrap_or_else(|error| {
+                            panic!("could not start nghttp3 server for {library}: {error:#}")
+                        })
+                    });
                     bencher.iter_custom(|iterations| {
-                        runner
-                            .run_iterations(iterations, case)
-                            .unwrap_or_else(|error| {
-                                panic!("{library} benchmark sample failed: {error:#}")
-                            })
+                        let elapsed =
+                            runner
+                                .run_iterations(iterations, case)
+                                .unwrap_or_else(|error| {
+                                    panic!("{library} benchmark sample failed: {error:#}")
+                                });
+                        completed_requests = iterations
+                            .checked_mul(case.requests as u64)
+                            .and_then(|requests| completed_requests.checked_add(requests))
+                            .expect("benchmark aggregate request count overflowed");
+                        elapsed
                     });
                 });
                 if let Some(mut server) = server {
-                    server.finish()?;
+                    server.finish(case, completed_requests)?;
                 }
                 group.finish();
             }

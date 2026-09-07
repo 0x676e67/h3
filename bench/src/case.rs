@@ -4,12 +4,13 @@ use std::{fmt, path::PathBuf, time::Duration};
 
 use anyhow::Result;
 
-use super::headers::HeaderMode;
+use super::headers::Directions;
 pub const SERVER_ADDR: &str = "127.0.0.1:4433";
-pub const SERVER_WORKERS: usize = 8;
 /// Leaves stream-credit headroom above the supported Client concurrency without
-/// making Quinn prebuild an impractically large remote-stream state table.
+/// relying on a transport library's default stream limit.
 pub const SERVER_MAX_BIDI_STREAMS: u32 = 1000;
+pub const QPACK_TABLE_CAPACITY: usize = 4096;
+pub const QPACK_BLOCKED_STREAMS: u64 = 100;
 pub const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
 pub const MAX_REQUESTS: usize = 20_000;
 pub const DEFAULT_BODY_BYTES: [usize; 9] = [
@@ -35,7 +36,8 @@ pub struct Case {
     pub body_bytes: usize,
     pub requests: usize,
     pub in_flight: usize,
-    pub headers: HeaderMode,
+    pub headers: Directions,
+    pub qpack: Directions,
 }
 
 impl Case {
@@ -52,9 +54,13 @@ impl Case {
             body_bytes,
             requests,
             in_flight,
-            headers: HeaderMode {
+            headers: Directions {
                 request: true,
                 response: true,
+            },
+            qpack: Directions {
+                request: false,
+                response: false,
             },
         }
     }

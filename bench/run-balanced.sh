@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
-# Runs the http3, h3, and nghttp3 Clients against both http3 and h3 Servers on Linux.
+# Runs the HTTP/3 Clients against a native nghttp3/ngtcp2 Server on Linux.
 #
-# The Rust Clients use a Tokio current-thread runtime. The native nghttp3
-# Client is built automatically by Cargo and uses one event-loop thread. This
-# script intentionally sets no CPU affinity: the operating system may migrate
+# The Rust Clients use a Tokio current-thread runtime. Cargo builds the native
+# nghttp3 Client and Server; each uses one event-loop thread. This script sets
+# no CPU affinity: the operating system may migrate
 # Client threads, so results measure single-threaded Client throughput rather
-# than strict single-core performance. The benchmark Server is a separate,
-# unpinned process with 8 Pingora no-steal workers: one for the Endpoint and seven
-# for connections. Connections rotate across those seven current-thread runtimes;
-# each connection's QUIC driver and request tasks stay together.
-# Both Server libraries share this scheduler, validation, and
-# transport settings. The native build requires CMake, a C compiler,
+# than strict single-core performance. The Server is a separate, unpinned process.
+# All Clients use the same Server, validation, response content, and transport
+# settings. Its single worker may limit throughput; these results do not establish
+# a Client-only ceiling. The native build requires CMake, a C compiler,
 # LLVM/libclang, NASM, and pkg-config. The published sys crates include the
 # required C sources, so repository submodules are not needed. Each sample ends
 # when the last complete response is validated;
@@ -24,7 +22,7 @@
 #   bash bench/run-balanced.sh -- --noplot
 # Custom body-size cases:
 #   bash bench/run-balanced.sh --body-sizes 0B,64KiB,1MiB \
-#     --requests 20000 --concurrency 32 --headers both -- --noplot
+#     --requests 20000 --concurrency 32 --headers both --qpack all -- --noplot
 
 set -euo pipefail
 
@@ -46,12 +44,22 @@ Options:
                        Counts exclude pseudo-headers, status, and content-length.
                        Both exercises Client QPACK encoding and decoding;
                        request or response isolates the added work's direction.
+  --qpack MODE        Dynamic compression: none, request, response, both, all (default).
+                       Independent of --headers: request enables Client encoding,
+                       response enables Client decoding. Capacity: 4096 bytes;
+                       permitted blocked streams: 100. h3 runs only none.
+                       The Server verifies actual references; allow enough requests
+                       to reuse the table after setup (e.g. 128 at concurrency 4).
   -h, --help           Show this help.
 
-For each selected body size, run the http3 Server and then the h3 Server.
-Under each Server, Clients run in this fixed order: http3, h3, nghttp3.
-Result names begin with the Client and include server-http3 or server-h3.
-Cargo builds the native nghttp3/ngtcp2 Client automatically. The
+For each body size, --qpack all runs none, request, response, both in that order.
+Static cases run Clients http3, h3, nghttp3; dynamic cases run http3, nghttp3.
+The pinned h3 Client only supports static QPACK and is explicitly skipped otherwise.
+Result names begin with the Client and include server-nghttp3-native-2 and /qpack-MODE.
+Each batch measures connection establishment and requests through the last
+complete response. Runtime, TLS configuration/certificate loading, UDP endpoint
+preparation and teardown are excluded. Each batch starts with a fresh QPACK table.
+Cargo builds the native nghttp3/ngtcp2 Client and Server automatically. The
 native build requires CMake, a C compiler, LLVM/libclang, NASM, and pkg-config.
 Criterion arguments such as --sample-size and --measurement-time override the
 harness defaults. The published sys crates include the required C sources, so
@@ -62,10 +70,11 @@ Default body sizes:
 
 Examples:
   bash bench/run-balanced.sh -- --noplot
-  bash bench/run-balanced.sh --body-sizes 0B,1KiB --headers response -- --noplot
-  bash bench/run-balanced.sh --body-sizes 1KiB -- server-h3 --noplot
+  bash bench/run-balanced.sh --body-sizes 0B,1KiB --headers response --qpack response -- --noplot
+  bash bench/run-balanced.sh --body-sizes 0B,1KiB,100KiB \
+    --requests 128 --concurrency 4 --qpack all -- --test
   bash bench/run-balanced.sh --body-sizes 0B,64KiB,1MiB \
-    --requests 20000 --concurrency 32 --headers both -- \
+    --requests 20000 --concurrency 32 --headers both --qpack all -- \
     --sample-size 20 --measurement-time 60 --noplot
 EOF
 }
@@ -74,6 +83,7 @@ body_sizes=
 requests=
 concurrency=
 headers=both
+qpack=all
 criterion_args=()
 
 while (($# > 0)); do
@@ -114,6 +124,14 @@ while (($# > 0)); do
       case $2 in
         none|request|response|both) headers=$2 ;;
         *) echo '--headers must be none, request, response, or both' >&2; exit 2 ;;
+      esac
+      shift 2
+      ;;
+    --qpack)
+      (($# >= 2)) || { echo '--qpack requires a value' >&2; exit 2; }
+      case $2 in
+        none|request|response|both|all) qpack=$2 ;;
+        *) echo '--qpack must be none, request, response, both, or all' >&2; exit 2 ;;
       esac
       shift 2
       ;;
@@ -162,6 +180,7 @@ else
   unset HTTP3_BENCH_CONCURRENCY || true
 fi
 export HTTP3_BENCH_HEADERS=$headers
+export HTTP3_BENCH_QPACK=$qpack
 
-echo 'Each body size: Server http3, then h3; each Server: Clients http3, h3, nghttp3'
+echo 'Server: nghttp3/ngtcp2, one native event loop; static Clients: http3, h3, nghttp3; dynamic Clients: http3, nghttp3'
 cargo bench -p bench --bench clients --locked -- "${criterion_args[@]}"
