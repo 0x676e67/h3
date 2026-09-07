@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# One Actions step owns one body size. Reuse the executable built
+# One Actions step owns one concurrency level. Reuse the executable built
 # by the workflow; compile/setup work must not run alongside Client samples.
-# Usage: BENCH_EXE=/path/to/clients bash bench/ci.sh 1KiB [Criterion options]
+# Usage: BENCH_EXE=/path/to/clients bash bench/ci.sh 1 [Criterion options]
 # Append --list to inspect coverage or --test for a functional smoke check.
 # Default comparison: fixed browser templates in both directions, static and
 # bidirectional dynamic QPACK. HTTP3_BENCH_SUITE=diagnostic selects all directions.
 # With GITHUB_STEP_SUMMARY set, append a table from measured Criterion JSON.
 set -euo pipefail
 
-export HTTP3_BENCH_BODY_SIZES=${1:?missing body size}
+concurrency=${1:?missing concurrency (1, 10, 50, or 100)}
 shift
+case "$concurrency" in
+  1|10|50|100) ;;
+  *) printf 'Concurrency must be 1, 10, 50, or 100: %s\n' "$concurrency" >&2; exit 2 ;;
+esac
+export HTTP3_BENCH_CONCURRENCY=$concurrency
 export HTTP3_BENCH_REQUESTS=1000
 suite=${HTTP3_BENCH_SUITE:-comparison}
 case "$suite" in
@@ -20,7 +25,7 @@ esac
 
 if [[ -n ${HTTP3_BENCH_RESULTS:-} ]]; then
   # Keep smoke runs and other suites out of the published measurement tables.
-  export CRITERION_HOME="$HTTP3_BENCH_RESULTS/$suite/$HTTP3_BENCH_BODY_SIZES"
+  export CRITERION_HOME="$HTTP3_BENCH_RESULTS/$suite/concurrency-$concurrency"
 fi
 
 summarize=true
@@ -28,8 +33,12 @@ for argument in "$@"; do
   case "$argument" in --list|--test) summarize=false ;; esac
 done
 
-for concurrency in 1 10 50 100; do
-  export HTTP3_BENCH_CONCURRENCY=$concurrency
+for body in 1KiB 10KiB 100KiB 0B; do
+  export HTTP3_BENCH_BODY_SIZES=$body
+  body_label=$body
+  if [[ $body == 0B ]]; then
+    body_label='0 B (headers and scheduling diagnostic)'
+  fi
   for headers in "${header_modes[@]}"; do
     export HTTP3_BENCH_HEADERS=$headers
     for qpack in "${qpack_modes[@]}"; do
@@ -39,8 +48,8 @@ for concurrency in 1 10 50 100; do
       else
         label="dynamic $qpack"
       fi
-      printf '::group::Concurrency: %s / Headers: %s / QPACK: %s\n' \
-        "$concurrency" "$headers" "$label"
+      printf '::group::Body: %s / Headers: %s / QPACK: %s\n' \
+        "$body_label" "$headers" "$label"
       # Without --bench, directly invoking Criterion selects its test mode.
       # The runner keeps the http3/h3/nghttp3 order and excludes unsupported h3
       # dynamic modes. All directions use the same batch and timing parameters.
@@ -54,5 +63,5 @@ done
 if [[ $summarize == true && -n ${GITHUB_STEP_SUMMARY:-} ]]; then
   python3 "$(dirname "${BASH_SOURCE[0]}")/summary.py" \
     "${CRITERION_HOME:?missing Criterion output directory}" \
-    "$HTTP3_BENCH_BODY_SIZES" "$suite" >> "$GITHUB_STEP_SUMMARY"
+    "$concurrency" "$suite" >> "$GITHUB_STEP_SUMMARY"
 fi

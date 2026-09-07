@@ -108,25 +108,25 @@ jobs:
         env:
           RUSTFLAGS: "-D warnings"
 
-      # Compare each body in one step, with concurrency grouped inside it.
+      # Compare all body sizes in one step per concurrency level.
       # Default: 4 bodies x 4 concurrency levels x (3 static + 2 dynamic) = 80.
       # Manual diagnostic: also vary all header and QPACK directions = 576.
       # Run sequentially against the same build; publish tables in Summary.
-      - name: 1 KiB / static and dynamic QPACK
+      - name: Concurrency 1
         if: ${{ !inputs.profile }}
-        run: bash bench/ci.sh 1KiB
+        run: bash bench/ci.sh 1
 
-      - name: 10 KiB / static and dynamic QPACK
+      - name: Concurrency 10
         if: ${{ !inputs.profile }}
-        run: bash bench/ci.sh 10KiB
+        run: bash bench/ci.sh 10
 
-      - name: 100 KiB / static and dynamic QPACK
+      - name: Concurrency 50
         if: ${{ !inputs.profile }}
-        run: bash bench/ci.sh 100KiB
+        run: bash bench/ci.sh 50
 
-      - name: 0 B / headers and scheduling diagnostic
+      - name: Concurrency 100
         if: ${{ !inputs.profile }}
-        run: bash bench/ci.sh 0B
+        run: bash bench/ci.sh 100
 
       - name: Upload benchmark measurements
         if: ${{ always() && !inputs.profile }}
