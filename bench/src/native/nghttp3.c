@@ -56,6 +56,13 @@ struct native_trace {
 
 #if defined(_WIN32)
 static LARGE_INTEGER qpc_frequency;
+#elif defined(__APPLE__)
+/* Match Rust Instant on Darwin. Unlike CLOCK_MONOTONIC's wall-time/boot-time
+   calculation, this raw uptime clock is not adjusted and excludes sleep.
+   https://github.com/rust-lang/rust/blob/31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd/library/std/src/sys/time/unix.rs#L55-L74 */
+static const clockid_t benchmark_clock = CLOCK_UPTIME_RAW;
+#else
+static const clockid_t benchmark_clock = CLOCK_MONOTONIC;
 #endif
 
 int socket_runtime_init(void) {
@@ -156,7 +163,39 @@ int socket_poll_one(socket_pollfd *pfd, uint64_t timeout_ns) {
       .tv_nsec = (long)(remaining % NGTCP2_SECONDS),
     };
     pfd->revents = 0;
+#if defined(__APPLE__)
+    /* Darwin has no ppoll. pselect preserves sub-millisecond deadlines;
+       poll's millisecond timeout would change native QUIC pacing. */
+    fd_set readable, writable, exceptional;
+    if (pfd->fd < 0 || pfd->fd >= FD_SETSIZE) {
+      errno = EINVAL;
+      return SOCKET_CALL_ERROR;
+    }
+    FD_ZERO(&readable);
+    FD_ZERO(&writable);
+    FD_ZERO(&exceptional);
+    if (pfd->events & SOCKET_READ_EVENT) {
+      FD_SET(pfd->fd, &readable);
+    }
+    if (pfd->events & SOCKET_WRITE_EVENT) {
+      FD_SET(pfd->fd, &writable);
+    }
+    FD_SET(pfd->fd, &exceptional);
+    rv = pselect(pfd->fd + 1, &readable, &writable, &exceptional, &timeout, NULL);
+    if (rv > 0) {
+      if (FD_ISSET(pfd->fd, &readable)) {
+        pfd->revents |= SOCKET_READ_EVENT;
+      }
+      if (FD_ISSET(pfd->fd, &writable)) {
+        pfd->revents |= SOCKET_WRITE_EVENT;
+      }
+      if (FD_ISSET(pfd->fd, &exceptional)) {
+        pfd->revents |= POLLERR;
+      }
+    }
+#else
     rv = ppoll(pfd, 1, &timeout, NULL);
+#endif
     if (rv != SOCKET_CALL_ERROR || errno != EINTR) {
       break;
     }
@@ -311,7 +350,7 @@ int monotonic_clock_init(void) {
            : -1;
 #else
   struct timespec now;
-  return clock_gettime(CLOCK_MONOTONIC, &now);
+  return clock_gettime(benchmark_clock, &now);
 #endif
 }
 
@@ -331,8 +370,10 @@ uint64_t timestamp_ns(void) {
   return secs * NGTCP2_SECONDS + rem * NGTCP2_SECONDS / freq;
 #else
   struct timespec now;
-  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
-    return 0;
+  if (clock_gettime(benchmark_clock, &now) != 0) {
+    /* A clock error is not timestamp zero: QUIC would see time go backwards. */
+    perror("benchmark clock_gettime");
+    exit(EXIT_FAILURE);
   }
   return (uint64_t)now.tv_sec * NGTCP2_SECONDS + (uint64_t)now.tv_nsec;
 #endif

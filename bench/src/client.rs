@@ -1,4 +1,9 @@
-//! Single-threaded Rust Client execution and shared `http3`/`h3` request driver.
+//! Rust Client execution and shared `http3`/`h3` request driver.
+//!
+//! Local scheduling experiments use `HTTP3_BENCH_RUNTIME` and
+//! `HTTP3_BENCH_RUST_WORKERS`; defaults remain Tokio current-thread. Keep a
+//! separate `CRITERION_HOME` per configuration: runtime is not part of result
+//! IDs yet. These switches do not change the native nghttp3 Client.
 
 use std::{
     future::Future,
@@ -72,17 +77,69 @@ pub fn run_from_args<A: Adapter>(mut args: impl Iterator<Item = String>) -> Resu
     if A::HTTP3_LIBRARY == "h3" && (qpack.request || qpack.response) {
         bail!("h3 only supports qpack=none in this benchmark");
     }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("could not create current-thread client runtime")?;
-    let result = runtime.block_on(run_client::<A>(
-        requests,
-        expected_body_size,
-        in_flight,
-        headers,
-        qpack,
-    ))?;
+    // Local contention experiment: change scheduling, not the connection or
+    // SendRequest ownership. Keep initialization outside the existing timer.
+    let threads = match std::env::var("HTTP3_BENCH_RUST_WORKERS") {
+        Ok(value) => value
+            .parse::<std::num::NonZeroUsize>()
+            .context("HTTP3_BENCH_RUST_WORKERS must be a positive integer")?
+            .get(),
+        Err(std::env::VarError::NotPresent) => 1,
+        Err(error) => return Err(error).context("could not read Rust worker count"),
+    };
+    let scheduling = match std::env::var("HTTP3_BENCH_RUNTIME") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => "tokio".to_owned(),
+        Err(error) => return Err(error).context("could not read Client runtime mode"),
+    };
+    eprintln!("runtime={scheduling}; workers={threads}; connections=1; sockets=1");
+    let result = match scheduling.as_str() {
+        "tokio" => {
+            let mut builder = if threads == 1 {
+                tokio::runtime::Builder::new_current_thread()
+            } else {
+                let mut builder = tokio::runtime::Builder::new_multi_thread();
+                builder.worker_threads(threads).thread_name("http3-worker");
+                builder
+            };
+            let runtime = builder
+                .enable_all()
+                .build()
+                .context("could not create Client runtime")?;
+            runtime.block_on(run_client::<A>(
+                requests,
+                expected_body_size,
+                in_flight,
+                headers,
+                qpack,
+                Vec::new(),
+            ))
+        }
+        "no-steal-local" | "no-steal-split" => {
+            let runtime = pingora_runtime::NoStealRuntime::new(threads, "http3-no-steal");
+            let request_runtimes = if scheduling == "no-steal-split" {
+                (0..threads)
+                    .map(|index| runtime.get_runtime_at(index).clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // Initialize the pool before timing and run Endpoint/connect/driver
+            // on worker 0. Direct block_on would run the root on the caller.
+            let owner = runtime.get_runtime_at(0);
+            let result = owner.block_on(owner.spawn(run_client::<A>(
+                requests,
+                expected_body_size,
+                in_flight,
+                headers,
+                qpack,
+                request_runtimes,
+            )));
+            runtime.shutdown_timeout(Duration::from_secs(5));
+            result.context("NoSteal Client task failed")?
+        }
+        _ => bail!("unsupported Client runtime {scheduling:?}"),
+    }?;
 
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
@@ -94,6 +151,7 @@ async fn run_client<A: Adapter>(
     in_flight: usize,
     headers: Directions,
     qpack: Directions,
+    request_runtimes: Vec<tokio::runtime::Handle>,
 ) -> Result<ClientResult> {
     let expected_bytes = requests
         .checked_mul(expected_body_size)
@@ -121,13 +179,23 @@ async fn run_client<A: Adapter>(
     // full like the native Client, even when one worker is slower than the rest.
     let remaining_requests = Arc::new(AtomicUsize::new(requests - worker_count));
     let mut workers = JoinSet::new();
-    for _ in 0..worker_count {
-        workers.spawn(run_request_worker::<A>(
+    for index in 0..worker_count {
+        let request_worker = run_request_worker::<A>(
             sender_guard.clone(),
             remaining_requests.clone(),
             expected_body_size,
             headers,
-        ));
+        );
+        if request_runtimes.is_empty() {
+            workers.spawn(request_worker);
+        } else {
+            // Assign a long-lived worker once, not each individual request.
+            // Fixed placement removes stealing but not shared-connection locks.
+            workers.spawn_on(
+                request_worker,
+                &request_runtimes[index % request_runtimes.len()],
+            );
+        }
     }
     while let Some(result) = workers.join_next().await {
         result.context("request worker failed")??;

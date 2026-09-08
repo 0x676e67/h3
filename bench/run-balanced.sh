@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the HTTP/3 Clients against a native nghttp3/ngtcp2 Server on Linux.
+# Runs the HTTP/3 Clients against a native nghttp3/ngtcp2 Server on Linux/macOS.
 #
 # The Rust Clients use a Tokio current-thread runtime. Cargo builds the native
 # nghttp3 Client and Server; each uses one event-loop thread. This script sets
@@ -9,7 +9,9 @@
 # All Clients use the same Server, validation, response content, and transport
 # settings. Its single worker may limit throughput; these results do not establish
 # a Client-only ceiling. The native build requires CMake, a C compiler,
-# LLVM/libclang, NASM, and pkg-config. The published sys crates include the
+# LLVM/libclang and pkg-config (NASM is for applicable x86 builds, not ARM Macs).
+# On macOS, use the Xcode command-line tools and make CMake available in PATH.
+# The published sys crates include the
 # required C sources, so repository submodules are not needed. Each batch timer
 # includes request-state allocation, connection establishment, all response
 # validation and normal task aggregation. Runtime, trust/TLS configuration,
@@ -63,7 +65,8 @@ certificate trust/TLS configuration, UDP endpoint/socket and address preparation
 happen before timing. Shutdown and result serialization are excluded.
 Each batch starts with a fresh QPACK table.
 Cargo builds the native nghttp3/ngtcp2 Client and Server automatically. The
-native build requires CMake, a C compiler, LLVM/libclang, NASM, and pkg-config.
+native build requires CMake, a C compiler, LLVM/libclang, and pkg-config.
+macOS requires Xcode command-line tools; ARM Macs do not require NASM.
 Criterion arguments such as --sample-size and --measurement-time override the
 harness defaults. The published sys crates include the required C sources, so
 repository submodules are not needed for this benchmark.
@@ -156,7 +159,7 @@ while (($# > 0)); do
 done
 
 case $(uname -s) in
-  Linux) ;;
+  Linux|Darwin) ;;
   *)
     echo "unsupported operating system: $(uname -s)" >&2
     exit 2
@@ -186,4 +189,5 @@ export HTTP3_BENCH_HEADERS=$headers
 export HTTP3_BENCH_QPACK=$qpack
 
 echo 'Server: nghttp3/ngtcp2, one native event loop; static Clients: http3, h3, nghttp3; dynamic Clients: http3, nghttp3'
-cargo bench -p bench --bench clients --locked -- "${criterion_args[@]}"
+# Bash 3.2 on macOS treats an empty array as unset under `set -u`.
+cargo bench -p bench --bench clients --locked -- ${criterion_args[@]+"${criterion_args[@]}"}

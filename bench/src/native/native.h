@@ -61,7 +61,7 @@
  * https://github.com/quinn-rs/quinn/blob/0343120eb7ccdd067a7e975613b96190c8562bf7/LICENSE-MIT
  *
  * This benchmark replaces the example's libev socket layer with a
- * single-threaded Windows/Linux polling loop. One unconnected UDP socket
+ * single-threaded Windows/Linux/macOS polling loop. One unconnected UDP socket
  * serves one client QUIC connection; the server routes incoming connection IDs
  * on one listening socket. Linux batches receive syscalls and uses UDP
  * GRO/GSO when the kernel supports them; all platforms retain a per-datagram
@@ -79,24 +79,31 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE
+#endif
+
 #if defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mswsock.h>
 #include <windows.h>
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__APPLE__)
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#if defined(__linux__)
 #include <netinet/udp.h>
+#endif
 #include <poll.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 #else
-#error "The nghttp3 benchmark supports only Windows and Linux"
+#error "The nghttp3 benchmark supports only Windows, Linux and macOS"
 #endif
 
 #include <inttypes.h>

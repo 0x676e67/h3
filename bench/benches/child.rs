@@ -48,7 +48,12 @@ impl ChildRole {
     }
 
     fn command(self, executable: &Path) -> Command {
-        let mut command = Command::new(executable);
+        // Local cross-build attribution keeps one Server executable while
+        // replacing only the Client. Ordinary runs still use this executable.
+        let server = matches!(self, Self::Server)
+            .then(|| std::env::var_os("HTTP3_BENCH_SERVER_EXE"))
+            .flatten();
+        let mut command = Command::new(server.as_deref().unwrap_or(executable.as_os_str()));
         command.arg(CHILD_MARKER).arg(self.argument());
         command
     }

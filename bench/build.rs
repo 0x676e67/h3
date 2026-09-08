@@ -17,9 +17,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=src/headers.txt");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS")?;
-    if target_os != "windows" && target_os != "linux" {
+    if !matches!(target_os.as_str(), "windows" | "linux" | "macos") {
         return Err(format!(
-            "the HTTP/3 Client benchmark supports only Windows and Linux, not {target_os}"
+            "the HTTP/3 Client benchmark supports Windows, Linux and macOS, not {target_os}"
         )
         .into());
     }
@@ -68,9 +68,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             .flag_if_supported("/external:W0");
     } else {
         build
-            .define("_GNU_SOURCE", None)
             .define("_POSIX_C_SOURCE", Some("200809L"))
             .flag_if_supported("-std=c11");
+        if target_os == "linux" {
+            build.define("_GNU_SOURCE", None);
+        }
     }
 
     build.compile("http3_bench_nghttp3");
