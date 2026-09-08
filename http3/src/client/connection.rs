@@ -48,12 +48,6 @@ fn take_qpack_encode_buffer(buffer: &mut BytesMut) -> Bytes {
     }
 }
 
-fn field_section_size(headers: &Header) -> Option<u64> {
-    headers.into_iter().try_fold(0_u64, |size, field| {
-        size.checked_add(u64::try_from(field.mem_size()).ok()?)
-    })
-}
-
 /// HTTP/3 request sender
 ///
 /// [`send_request()`] initiates a new request and will resolve when it is ready to be sent
@@ -240,12 +234,17 @@ where
         if let Some(encoder) = dynamic_encoder {
             // Dynamic references are tracked by the actual QUIC request stream
             // ID. Check the peer's limit before mutating the encoder table.
-            let mem_size = field_section_size(&headers).ok_or_else(|| {
-                self.handle_connection_error_on_stream(InternalConnectionError::new(
-                    Code::H3_INTERNAL_ERROR,
-                    "request field section size overflowed".to_string(),
-                ))
-            })?;
+            let mem_size = headers
+                .into_iter()
+                .try_fold(0_u64, |size, field| {
+                    size.checked_add(field.mem_size() as u64)
+                })
+                .ok_or_else(|| {
+                    self.handle_connection_error_on_stream(InternalConnectionError::new(
+                        Code::H3_INTERNAL_ERROR,
+                        "request field section size overflowed".to_string(),
+                    ))
+                })?;
             stream = future::poll_fn(|cx| self.open.poll_open_bidi(cx))
                 .await
                 .map_err(|e| self.handle_quic_stream_error(e))?;
@@ -269,6 +268,7 @@ where
                         ));
                     }
                 };
+
             drop(headers);
             let block = take_qpack_encode_buffer(&mut self.qpack_encode_buffer);
             if encoder_instructions_queued {
