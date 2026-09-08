@@ -86,17 +86,67 @@ static int socket_set_nonblocking(socket_handle fd) {
 #endif
 }
 
-int socket_poll_one(socket_pollfd *pfd, int timeout_ms) {
-#if defined(_WIN32)
-  return WSAPoll(pfd, 1, timeout_ms);
-#else
+int socket_poll_one(socket_pollfd *pfd, uint64_t timeout_ns) {
   int rv;
-  do {
+  /* QUIC expiry includes pacing and ACK deadlines. Rounding every positive
+     sub-millisecond delay to 1 ms can stall each serial request in a batch.
+     Keep the deadline precision without turning short waits into busy polls.
+     https://man7.org/linux/man-pages/man2/poll.2.html
+     https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-select */
+#if defined(_WIN32)
+  fd_set readable, writable, exceptional;
+  struct timeval timeout;
+  FD_ZERO(&readable);
+  FD_ZERO(&writable);
+  FD_ZERO(&exceptional);
+  if (pfd->events & SOCKET_READ_EVENT) {
+    FD_SET(pfd->fd, &readable);
+  }
+  if (pfd->events & SOCKET_WRITE_EVENT) {
+    FD_SET(pfd->fd, &writable);
+  }
+  FD_SET(pfd->fd, &exceptional);
+  /* Callers cap each wait at POLL_CAP_NS (10 ms). */
+  timeout.tv_sec = 0;
+  timeout.tv_usec = (long)((timeout_ns +
+                           NGTCP2_MICROSECONDS - 1) / NGTCP2_MICROSECONDS);
+  pfd->revents = 0;
+  rv = select(0, &readable, &writable, &exceptional, &timeout);
+  if (rv > 0) {
+    if (FD_ISSET(pfd->fd, &readable)) {
+      pfd->revents |= SOCKET_READ_EVENT;
+    }
+    if (FD_ISSET(pfd->fd, &writable)) {
+      pfd->revents |= SOCKET_WRITE_EVENT;
+    }
+    if (FD_ISSET(pfd->fd, &exceptional)) {
+      pfd->revents |= POLLERR;
+    }
+  }
+#else
+  uint64_t started = timestamp_ns();
+  uint64_t remaining = timeout_ns;
+  for (;;) {
+    struct timespec timeout = {
+      .tv_sec = (time_t)(remaining / NGTCP2_SECONDS),
+      .tv_nsec = (long)(remaining % NGTCP2_SECONDS),
+    };
     pfd->revents = 0;
-    rv = poll(pfd, 1, timeout_ms);
-  } while (rv == SOCKET_CALL_ERROR && errno == EINTR);
-  return rv;
+    rv = ppoll(pfd, 1, &timeout, NULL);
+    if (rv != SOCKET_CALL_ERROR || errno != EINTR) {
+      break;
+    }
+    /* A signal must not restart the complete QUIC delay. */
+    uint64_t elapsed = timestamp_ns() - started;
+    if (elapsed >= timeout_ns) {
+      pfd->revents = 0;
+      rv = 0;
+      break;
+    }
+    remaining = timeout_ns - elapsed;
+  }
 #endif
+  return rv;
 }
 
 static int socket_send_datagram(socket_handle fd, const uint8_t *data,
@@ -1338,19 +1388,14 @@ int handle_expiry(client *c, uint64_t now) {
   return 0;
 }
 
-int poll_timeout_ms(client *c, uint64_t now) {
+uint64_t poll_timeout_ns(client *c, uint64_t now) {
   uint64_t expiry = ngtcp2_conn_get_expiry2(c->qconn);
   uint64_t delta;
-  uint64_t millis;
   if (expiry <= now) {
     return 0;
   }
   delta = expiry - now;
-  millis = (delta + NGTCP2_MILLISECONDS - 1) / NGTCP2_MILLISECONDS;
-  if (millis > POLL_CAP_MS) {
-    millis = POLL_CAP_MS;
-  }
-  return (int)millis;
+  return delta < POLL_CAP_NS ? delta : POLL_CAP_NS;
 }
 
 int send_connection_close_best_effort(client *c,
@@ -1397,7 +1442,7 @@ int send_connection_close_best_effort(client *c,
     int socket_error;
     uint64_t elapsed;
     uint64_t remaining;
-    uint64_t timeout_ms;
+    uint64_t timeout_ns;
     socket_pollfd pfd;
     int poll_result;
 
@@ -1425,16 +1470,12 @@ int send_connection_close_best_effort(client *c,
       return -1;
     }
     remaining = CLOSE_FLUSH_NS - elapsed;
-    timeout_ms =
-      (remaining + NGTCP2_MILLISECONDS - 1) / NGTCP2_MILLISECONDS;
-    if (timeout_ms > POLL_CAP_MS) {
-      timeout_ms = POLL_CAP_MS;
-    }
+    timeout_ns = remaining < POLL_CAP_NS ? remaining : POLL_CAP_NS;
 
     memset(&pfd, 0, sizeof(pfd));
     pfd.fd = endpoint->fd;
     pfd.events = SOCKET_WRITE_EVENT;
-    poll_result = socket_poll_one(&pfd, (int)timeout_ms);
+    poll_result = socket_poll_one(&pfd, timeout_ns);
     if (poll_result == SOCKET_CALL_ERROR) {
       fprintf(stderr,
               "warning: CONNECTION_CLOSE poll failed: socket error %d\n",

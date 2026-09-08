@@ -55,7 +55,7 @@ Options:
 For each body size, --qpack all runs none, request, response, both in that order.
 Static cases run Clients http3, h3, nghttp3; dynamic cases run http3, nghttp3.
 The pinned h3 Client only supports static QPACK and is explicitly skipped otherwise.
-Result names begin with the Client and include server-nghttp3-native-2 and /qpack-MODE.
+Result names begin with the Client and include server-nghttp3-native-3 and /qpack-MODE.
 Each batch measures connection establishment and requests through the last
 complete response. Runtime, TLS configuration/certificate loading, UDP endpoint
 preparation and teardown are excluded. Each batch starts with a fresh QPACK table.

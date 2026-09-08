@@ -343,7 +343,7 @@ static int run_server(client *listener) {
   bool force_zero_timeout = false;
   for (;;) {
     uint64_t now = timestamp_ns();
-    int timeout = force_zero_timeout ? 0 : POLL_CAP_MS;
+    uint64_t timeout = force_zero_timeout ? 0 : POLL_CAP_NS;
     bool pending_tx = false;
     client **entry = &server->connections;
     socket_pollfd pfd;
@@ -379,9 +379,9 @@ static int run_server(client *listener) {
           timeout = 0;
         }
         pending_tx |= c->pending_tx_len != 0;
-        rv = poll_timeout_ms(c, timestamp_ns());
-        if (rv < timeout) {
-          timeout = rv;
+        uint64_t connection_timeout = poll_timeout_ns(c, timestamp_ns());
+        if (connection_timeout < timeout) {
+          timeout = connection_timeout;
         }
       }
       entry = &c->next;

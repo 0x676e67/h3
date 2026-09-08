@@ -161,7 +161,7 @@
 #define CONNECTION_RECEIVE_WINDOW (10 * 1024 * 1024)
 #define NO_PROGRESS_NS (30ULL * NGTCP2_SECONDS)
 #define CLOSE_FLUSH_NS (100ULL * NGTCP2_MILLISECONDS)
-#define POLL_CAP_MS 10
+#define POLL_CAP_NS (10ULL * NGTCP2_MILLISECONDS)
 #define CLIENT_CONNECTION_ID_LENGTH 16
 #define SERVER_MAX_BIDI_STREAMS 1000
 #define QPACK_TABLE_CAPACITY 4096
@@ -341,7 +341,7 @@ void server_quic_callbacks(ngtcp2_callbacks *callbacks);
 int socket_runtime_init(void);
 void socket_runtime_cleanup(void);
 int socket_last_error(void);
-int socket_poll_one(socket_pollfd *pfd, int timeout_ms);
+int socket_poll_one(socket_pollfd *pfd, uint64_t timeout_ns);
 int monotonic_clock_init(void);
 uint64_t timestamp_ns(void);
 void set_fatal(client *c, const char *fmt, ...);
@@ -357,7 +357,7 @@ rx_drain_result process_received_packet(
 rx_drain_result drain_rx(udp_endpoint *endpoint, client *c,
                                 bool stop_at_benchmark_completion);
 int handle_expiry(client *c, uint64_t now);
-int poll_timeout_ms(client *c, uint64_t now);
+uint64_t poll_timeout_ns(client *c, uint64_t now);
 int send_connection_close_best_effort(client *c,
                                              uint64_t close_started);
 int create_udp_endpoint(udp_endpoint *endpoint, client *error_client);

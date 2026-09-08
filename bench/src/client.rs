@@ -3,7 +3,10 @@
 use std::{
     future::Future,
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -111,17 +114,17 @@ async fn run_client<A: Adapter>(
     let quic_connection = connection.quic_connection;
     let sender_guard = connection.sender;
     let worker_count = requests.min(in_flight);
-    let requests_per_worker = requests / worker_count;
-    let workers_with_extra_request = requests % worker_count;
+    // Reserve one request per worker so every completion timestamp follows a
+    // response. Share the rest to keep filling idle slots like the native Client,
+    // including when a slow worker would outlive a fixed per-worker quota.
+    let remaining_requests = Arc::new(AtomicUsize::new(requests - worker_count));
     let (prepared_tx, mut prepared_rx) = mpsc::channel(worker_count);
     let (start_tx, start_rx) = watch::channel(false);
     let mut workers = JoinSet::new();
-    for worker_index in 0..worker_count {
-        let assigned_requests =
-            requests_per_worker + usize::from(worker_index < workers_with_extra_request);
+    for _ in 0..worker_count {
         workers.spawn(run_request_worker::<A>(
             sender_guard.clone(),
-            assigned_requests,
+            remaining_requests.clone(),
             expected_body_size,
             headers,
             prepared_tx.clone(),
@@ -239,7 +242,7 @@ async fn connect<A: Adapter>(
 
 async fn run_request_worker<A: Adapter>(
     mut sender: A::Sender,
-    assigned_requests: usize,
+    remaining_requests: Arc<AtomicUsize>,
     expected_body_size: usize,
     headers: Directions,
     prepared: mpsc::Sender<()>,
@@ -257,7 +260,7 @@ async fn run_request_worker<A: Adapter>(
             .await
             .context("benchmark start barrier closed before release")?;
     }
-    for _ in 0..assigned_requests {
+    loop {
         A::send_request(
             &mut sender,
             request_uri.clone(),
@@ -265,6 +268,16 @@ async fn run_request_worker<A: Adapter>(
             headers,
         )
         .await?;
+        // This counter hands out request slots, not data from another worker.
+        // A failed decrement leaves zero intact, even when every worker exits.
+        if remaining_requests
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_err()
+        {
+            break;
+        }
     }
     // This timestamp defines the throughput denominator. Taking it after
     // JoinSet aggregation would charge Rust-only scheduler unwinding and make
@@ -382,12 +395,17 @@ macro_rules! client_adapter {
                     headers.response,
                 )
                 .context("invalid benchmark response headers")?;
-                let declared_body_size = response
+                let mut content_lengths = response
                     .headers()
-                    .get(http::header::CONTENT_LENGTH)
-                    .context("response omitted content-length")?
-                    .to_str()?
-                    .parse::<usize>()?;
+                    .get_all(http::header::CONTENT_LENGTH)
+                    .iter();
+                let content_length = content_lengths
+                    .next()
+                    .context("response omitted content-length")?;
+                if content_lengths.next().is_some() {
+                    anyhow::bail!("response contained duplicate content-length fields");
+                }
+                let declared_body_size = content_length.to_str()?.parse::<usize>()?;
                 if declared_body_size != expected_body_size {
                     anyhow::bail!(
                         "expected content-length {expected_body_size}, got {declared_body_size}"

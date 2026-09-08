@@ -25,7 +25,7 @@ def expected_cases(body, suite, concurrency=None):
     modes = ("none", "both") if suite == "comparison" else QPACK
     levels = CONCURRENCY if concurrency is None else (concurrency,)
     return {
-        f"{client}/{label}/server-nghttp3-native-2/requests-1000/"
+        f"{client}/{label}/server-nghttp3-native-3/requests-1000/"
         f"concurrency-{concurrency}/headers-{header}/qpack-{mode}":
         (client, concurrency, header, mode)
         for header in headers

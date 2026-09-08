@@ -174,10 +174,10 @@ fn run_groups(criterion: &mut Criterion, config: &Config, executable: &Path) -> 
                     );
                     continue;
                 }
-                // v2 measures connection establishment too; never overwrite the
-                // v1 post-setup results or the previous Rust Server baselines.
+                // v3 fixes native wait precision and the shared request budget.
+                // Keep older scheduling, timer and Server baselines separate.
                 let mut group =
-                    criterion.benchmark_group(format!("{library}/{case}/server-nghttp3-native-2"));
+                    criterion.benchmark_group(format!("{library}/{case}/server-nghttp3-native-3"));
                 group.sampling_mode(SamplingMode::Flat);
                 if !config.test_mode && !config.sample_size_from_cli {
                     group.sample_size(10);

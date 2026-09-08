@@ -85,7 +85,7 @@ jobs:
                 clients=(http3 nghttp3)
                 if [[ "$qpack" == none ]]; then clients=(http3 h3 nghttp3); fi
                 for client in "${clients[@]}"; do
-                  printf '%s/%s/server-nghttp3-native-2/requests-1000/concurrency-100/headers-%s/qpack-%s: benchmark\n' \
+                  printf '%s/%s/server-nghttp3-native-3/requests-1000/concurrency-100/headers-%s/qpack-%s: benchmark\n' \
                     "$client" "$body" "$headers" "$qpack"
                 done
               done
@@ -102,8 +102,13 @@ jobs:
         run: |
           # Repeated requests let the dynamic encoder receive table feedback
           # before the batch finishes; four requests would not prove table reuse.
+          # A non-divisible budget also exercises the shared request window tail.
           bash bench/run-balanced.sh \
-            --body-sizes 0B,1KiB,100KiB --requests 128 --concurrency 4 \
+            --body-sizes 0B,1KiB,100KiB --requests 127 --concurrency 4 \
+            --headers both --qpack all -- --test
+          # Exactly one request per worker leaves no shared budget to consume.
+          bash bench/run-balanced.sh \
+            --body-sizes 0B --requests 4 --concurrency 4 \
             --headers both --qpack all -- --test
         env:
           RUSTFLAGS: "-D warnings"

@@ -301,7 +301,7 @@ static int run_until_phase(client *c, run_phase phase) {
 
   for (;;) {
     uint64_t now = timestamp_ns();
-    int timeout = force_zero_timeout ? 0 : POLL_CAP_MS;
+    uint64_t timeout = force_zero_timeout ? 0 : POLL_CAP_NS;
     int poll_result;
     bool pending_tx = false;
     force_zero_timeout = false;
@@ -321,17 +321,17 @@ static int run_until_phase(client *c, run_phase phase) {
       return -1;
     }
     {
-      int client_timeout = drive_tx(c);
-      if (client_timeout < 0) {
+      int tx_result = drive_tx(c);
+      if (tx_result < 0) {
         return -1;
       }
-      if (client_timeout > 0) {
+      if (tx_result > 0) {
         force_zero_timeout = true;
         timeout = 0;
       }
       pending_tx = c->pending_tx_len != 0;
       if (!force_zero_timeout) {
-        client_timeout = poll_timeout_ms(c, timestamp_ns());
+        uint64_t client_timeout = poll_timeout_ns(c, timestamp_ns());
         if (client_timeout < timeout) {
           timeout = client_timeout;
         }
