@@ -14,7 +14,7 @@ anyhow = { workspace = true }
 # Match the AWS-LC versions used by the published ngtcp2 0.2.0 bindings.
 aws-lc-rs = "=1.17.3"
 aws-lc-sys = { version = "=0.43.0", features = ["ssl"] }
-bytesize = "=2.3.1"
+bytesize = "=2.7.0"
 bytes = { workspace = true }
 http = { workspace = true }
 http3 = { workspace = true }
