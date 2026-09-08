@@ -14,10 +14,7 @@ use anyhow::{Context, Result, bail};
 use http::Uri;
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::CertificateDer;
-use tokio::{
-    sync::{mpsc, watch},
-    task::{JoinHandle, JoinSet},
-};
+use tokio::task::{JoinHandle, JoinSet};
 
 use super::{
     case::{ALPN_H3, SERVER_ADDR, SERVER_NAME, workspace_root},
@@ -105,21 +102,23 @@ async fn run_client<A: Adapter>(
     let client_config = client_config()?;
     let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse()?)?;
     endpoint.set_default_client_config(client_config);
+    let server_addr: SocketAddr = SERVER_ADDR.parse()?;
+    let collect_stats = std::env::var_os("HTTP3_BENCH_QUINN_STATS").is_some();
     // Reusable setup (runtime, trust store, TLS configuration and UDP endpoint)
     // is excluded. Include this connection's TLS/QUIC handshake and HTTP/3 setup,
-    // followed by all requests, through the last fully validated response.
+    // batch bookkeeping, requests and joining the completed request workers.
     let benchmark_started = Instant::now();
-    let connection = connect::<A>(&endpoint, qpack).await?;
+    let connection = connect::<A>(&endpoint, server_addr, qpack).await?;
     let driver = connection.driver;
     let quic_connection = connection.quic_connection;
     let sender_guard = connection.sender;
+    // Optional profiling captures request counters before spawning workers.
+    // Its snapshot is inside the timer, so profiling timings are diagnostic only.
+    let stats_before = collect_stats.then(|| quic_connection.stats());
     let worker_count = requests.min(in_flight);
-    // Reserve one request per worker so every completion timestamp follows a
-    // response. Share the rest to keep filling idle slots like the native Client,
-    // including when a slow worker would outlive a fixed per-worker quota.
+    // Each worker starts one request, then takes shared slots to keep the window
+    // full like the native Client, even when one worker is slower than the rest.
     let remaining_requests = Arc::new(AtomicUsize::new(requests - worker_count));
-    let (prepared_tx, mut prepared_rx) = mpsc::channel(worker_count);
-    let (start_tx, start_rx) = watch::channel(false);
     let mut workers = JoinSet::new();
     for _ in 0..worker_count {
         workers.spawn(run_request_worker::<A>(
@@ -127,39 +126,14 @@ async fn run_client<A: Adapter>(
             remaining_requests.clone(),
             expected_body_size,
             headers,
-            prepared_tx.clone(),
-            start_rx.clone(),
         ));
     }
-    drop(prepared_tx);
-    drop(start_rx);
-    for _ in 0..worker_count {
-        prepared_rx
-            .recv()
-            .await
-            .context("request workers exited before reaching the start barrier")?;
-    }
-    // Opt-in profiling snapshots delimit request-only transport counters. They
-    // occur after setup inside this connection-inclusive timer; profile-mode
-    // timings are diagnostic, not the throughput comparison.
-    let stats_before = std::env::var_os("HTTP3_BENCH_QUINN_STATS").map(|_| quic_connection.stats());
-    start_tx
-        .send(true)
-        .context("request workers exited before the benchmark started")?;
-
-    let mut finished_at = None;
     while let Some(result) = workers.join_next().await {
-        let worker_finished_at = result.context("request worker failed")??;
-        // Workers overlap, so the batch ends at the latest completion. Summing
-        // their durations would double-count parallel request work.
-        finished_at = Some(finished_at.map_or(worker_finished_at, |current: Instant| {
-            current.max(worker_finished_at)
-        }));
+        result.context("request worker failed")??;
     }
-    let finished_at = finished_at.context("connection did not run any request workers")?;
-    let elapsed = finished_at
-        .checked_duration_since(benchmark_started)
-        .context("benchmark finish timestamp preceded its start")?;
+    // Measure the whole batch at the caller, including normal task completion.
+    // Final statistics, connection shutdown and result formatting stay out.
+    let elapsed = benchmark_started.elapsed();
     let stats_after = quic_connection.stats();
     let path_max_udp_payload_size = usize::from(stats_after.path.current_mtu);
     if let Some(stats_before) = stats_before {
@@ -225,9 +199,9 @@ fn client_config() -> Result<quinn::ClientConfig> {
 
 async fn connect<A: Adapter>(
     endpoint: &quinn::Endpoint,
+    server_addr: SocketAddr,
     qpack: Directions,
 ) -> Result<ReadyConnection<A::Sender>> {
-    let server_addr: SocketAddr = SERVER_ADDR.parse()?;
     let connection = endpoint.connect(server_addr, SERVER_NAME)?.await?;
     let handshake = connection
         .handshake_data()
@@ -245,21 +219,8 @@ async fn run_request_worker<A: Adapter>(
     remaining_requests: Arc<AtomicUsize>,
     expected_body_size: usize,
     headers: Directions,
-    prepared: mpsc::Sender<()>,
-    mut start: watch::Receiver<bool>,
-) -> Result<Instant> {
+) -> Result<()> {
     let request_uri = Uri::from_static(REQUEST_URI);
-    prepared
-        .send(())
-        .await
-        .context("benchmark controller exited before request worker was prepared")?;
-    drop(prepared);
-    if !*start.borrow_and_update() {
-        start
-            .changed()
-            .await
-            .context("benchmark start barrier closed before release")?;
-    }
     loop {
         A::send_request(
             &mut sender,
@@ -279,10 +240,7 @@ async fn run_request_worker<A: Adapter>(
             break;
         }
     }
-    // This timestamp defines the throughput denominator. Taking it after
-    // JoinSet aggregation would charge Rust-only scheduler unwinding and make
-    // the cross-stack comparison unfair.
-    Ok(Instant::now())
+    Ok(())
 }
 
 fn parse_positive(args: &mut impl Iterator<Item = String>, name: &str) -> Result<usize> {

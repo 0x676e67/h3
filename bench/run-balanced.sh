@@ -10,10 +10,11 @@
 # settings. Its single worker may limit throughput; these results do not establish
 # a Client-only ceiling. The native build requires CMake, a C compiler,
 # LLVM/libclang, NASM, and pkg-config. The published sys crates include the
-# required C sources, so repository submodules are not needed. Each sample ends
-# when the last complete response is validated;
-# task aggregation, extra receive draining, final result checks, and shutdown
-# are not included in its elapsed time.
+# required C sources, so repository submodules are not needed. Each batch timer
+# includes request-state allocation, connection establishment, all response
+# validation and normal task aggregation. Runtime, trust/TLS configuration,
+# socket and address preparation precede it; shutdown and result serialization
+# follow it.
 # Each Client uses one HTTP/3 connection and one UDP socket. Concurrent
 # requests use streams on that connection, following RFC 9114 Section 3.3:
 # https://www.rfc-editor.org/rfc/rfc9114.html#section-3.3
@@ -55,10 +56,12 @@ Options:
 For each body size, --qpack all runs none, request, response, both in that order.
 Static cases run Clients http3, h3, nghttp3; dynamic cases run http3, nghttp3.
 The pinned h3 Client only supports static QPACK and is explicitly skipped otherwise.
-Result names begin with the Client and include server-nghttp3-native-3 and /qpack-MODE.
-Each batch measures connection establishment and requests through the last
-complete response. Runtime, TLS configuration/certificate loading, UDP endpoint
-preparation and teardown are excluded. Each batch starts with a fresh QPACK table.
+Result names begin with the Client and include server-nghttp3-native-4 and /qpack-MODE.
+Each batch uses one timer covering request-state allocation, connection
+establishment, all response validation and normal task aggregation. Runtime,
+certificate trust/TLS configuration, UDP endpoint/socket and address preparation
+happen before timing. Shutdown and result serialization are excluded.
+Each batch starts with a fresh QPACK table.
 Cargo builds the native nghttp3/ngtcp2 Client and Server automatically. The
 native build requires CMake, a C compiler, LLVM/libclang, NASM, and pkg-config.
 Criterion arguments such as --sample-size and --measurement-time override the

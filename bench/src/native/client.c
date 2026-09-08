@@ -25,7 +25,7 @@
  * WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-/* Client requests, response validation and connect-to-last-response timing.
+/* Client requests, response validation and complete-batch timing.
    Shared transport configuration and fixed source references are in native.h. */
 #include "native.h"
 
@@ -218,12 +218,6 @@ static int on_nghttp3_end_stream(
   --c->active;
   ++c->completed;
   c->received_bytes += r->body_bytes;
-  if (c->completed == c->target_requests) {
-    /* This timestamp defines the throughput denominator.  Taking it after the
-       outer event loop returns would add implementation-specific drain and
-       control-flow overhead, producing an unfair cross-stack statistic. */
-    c->measurement_finished_ns = timestamp_ns();
-  }
   return 0;
 }
 
@@ -455,6 +449,7 @@ int http3_bench_nghttp3_main(int argc, char **argv) {
   client c;
   SSL_CTX *ssl_ctx = NULL;
   uint64_t benchmark_started;
+  uint64_t benchmark_finished;
   uint64_t expected_total_bytes;
   size_t path_max_udp_payload_size;
   uint64_t elapsed_ns;
@@ -493,14 +488,14 @@ int http3_bench_nghttp3_main(int argc, char **argv) {
     fprintf(stderr, "UDP endpoint init failed: %s\n", c.fatal_reason);
     goto cleanup_client;
   }
+  /* Exclude reusable TLS configuration, trust loading and socket preparation.
+     Include this batch's response storage, TLS/QUIC creation and handshake,
+     requests and normal event-loop return, like the Rust request task join. */
+  benchmark_started = timestamp_ns();
   if (client_prepare(&c, &endpoint, &config) != 0) {
     fprintf(stderr, "client init failed: %s\n", c.fatal_reason);
     goto cleanup_client;
   }
-  /* Exclude reusable TLS configuration, trust loading, socket buffers and
-     response storage. Count per-connection TLS/QUIC creation and the handshake,
-     matching Rust Endpoint::connect through the last complete response. */
-  benchmark_started = timestamp_ns();
   c.last_progress_ns = benchmark_started;
   if (init_tls(&c, ssl_ctx) != 0 || init_quic(&c, NULL, NULL) != 0) {
     fprintf(stderr, "client init failed: %s\n", c.fatal_reason);
@@ -519,6 +514,9 @@ int http3_bench_nghttp3_main(int argc, char **argv) {
     }
     goto cleanup_client;
   }
+  /* The loop returns once every response is validated, without draining extra
+     datagrams. Keep its normal unwinding in the batch, but not connection close. */
+  benchmark_finished = timestamp_ns();
   path_max_udp_payload_size =
     ngtcp2_conn_get_path_max_tx_udp_payload_size2(c.qconn);
   (void)send_connection_close_best_effort(&c, timestamp_ns());
@@ -526,7 +524,7 @@ int http3_bench_nghttp3_main(int argc, char **argv) {
   if (c.started != config.requests || c.completed != config.requests ||
       c.active != 0 ||
       c.received_bytes != expected_total_bytes ||
-      c.measurement_finished_ns <= benchmark_started) {
+      benchmark_finished <= benchmark_started) {
     fprintf(stderr,
             "client final validation failed: started=%" PRIu64
             " completed=%" PRIu64 " active=%zu bytes=%" PRIu64 "\n",
@@ -534,14 +532,14 @@ int http3_bench_nghttp3_main(int argc, char **argv) {
     goto cleanup_client;
   }
 
-  elapsed_ns = c.measurement_finished_ns - benchmark_started;
-  printf("{\"schema\":\"http3-client-bench-v14\","
+  elapsed_ns = benchmark_finished - benchmark_started;
+  printf("{\"schema\":\"http3-client-bench-v15\","
          "\"http3_library\":\"nghttp3\","
          "\"quic_backend\":\"ngtcp2\","
          "\"transport_profile\":"
          "\"ngtcp2-1350b-1mib-stream-10mib-connection\","
          "\"measurement_profile\":"
-         "\"connect-to-last-response\","
+         "\"connect-to-batch-complete\","
          "\"requests\":%" PRIu64 ","
          "\"in_flight\":%zu,"
          "\"request_headers\":%zu,"

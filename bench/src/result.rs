@@ -10,11 +10,11 @@ use super::{
     headers::{REQUEST_HEADERS, RESPONSE_HEADERS},
 };
 
-// v14 includes connection establishment while excluding reusable Client setup.
-pub(crate) const RESULT_SCHEMA: &str = "http3-client-bench-v14";
+// v15 includes per-batch bookkeeping and normal request task/loop completion.
+pub(crate) const RESULT_SCHEMA: &str = "http3-client-bench-v15";
 
 /// Timed region shared by every Client implementation.
-pub const MEASUREMENT_PROFILE: &str = "connect-to-last-response";
+pub const MEASUREMENT_PROFILE: &str = "connect-to-batch-complete";
 
 /// Server-side wire counters, reported after the measured Client batches.
 #[derive(Debug, Deserialize)]

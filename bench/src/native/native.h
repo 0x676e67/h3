@@ -297,7 +297,6 @@ struct client {
   uint64_t started;
   uint64_t completed;
   uint64_t received_bytes;
-  uint64_t measurement_finished_ns;
   size_t inflight_limit;
   size_t request_headers;
   size_t response_headers;

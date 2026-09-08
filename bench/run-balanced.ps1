@@ -7,14 +7,16 @@ For each selected body size, runs the selected QPACK modes against the native
 nghttp3/ngtcp2 Server. With -Qpack all, modes run in order: none, request,
 response, both. Static cases run Clients in order: http3, h3, nghttp3; dynamic
 cases run http3, nghttp3 because the pinned h3 Client only supports static QPACK.
-Result names begin with the Client and include server-nghttp3-native-3,
+Result names begin with the Client and include server-nghttp3-native-4,
 the body size, and /qpack-MODE. Body sizes use
 IEC units; the default cases are 0 B, 1 KiB, 10 KiB, 64 KiB, 128 KiB, 1 MiB,
 2 MiB, 4 MiB, and 100 MiB.
 
-Each batch measures connection establishment and requests through the last
-complete response. Runtime, TLS configuration/certificate loading, UDP endpoint
-preparation and teardown are excluded. Each batch starts with a fresh QPACK table.
+Each batch uses one timer covering request-state allocation, connection
+establishment, all response validation and normal task aggregation. Runtime,
+certificate trust/TLS configuration, UDP endpoint/socket and address preparation
+happen before timing. Shutdown and result serialization are excluded.
+Each batch starts with a fresh QPACK table.
 
 Every Client uses one HTTP/3 connection and one UDP socket. Concurrent requests
 use streams on that connection, matching RFC 9114 Section 3.3 guidance against
@@ -35,10 +37,6 @@ The native Server is a separate, unpinned process with one event-loop thread.
 All Clients use the same Server, validation, response content, and transport
 settings. Results describe complete Client stacks against this Server, whose
 single worker may limit throughput; they do not establish a Client-only ceiling.
-
-Each sample ends when the last complete response has been validated. Task
-aggregation, extra receive draining, final result checks, and connection shutdown
-are outside the measured interval.
 
 .PARAMETER BodySizes
 Optional comma-separated response sizes such as 0B,64KiB,1MiB. Omitting this

@@ -25,7 +25,7 @@ def expected_cases(body, suite, concurrency=None):
     modes = ("none", "both") if suite == "comparison" else QPACK
     levels = CONCURRENCY if concurrency is None else (concurrency,)
     return {
-        f"{client}/{label}/server-nghttp3-native-3/requests-1000/"
+        f"{client}/{label}/server-nghttp3-native-4/requests-1000/"
         f"concurrency-{concurrency}/headers-{header}/qpack-{mode}":
         (client, concurrency, header, mode)
         for header in headers
@@ -79,7 +79,9 @@ def read_results(root, body, suite, concurrency=None):
 def render(values, concurrency, suite):
     lines = [f"## Concurrency {concurrency}: {suite}", "",
              "Median batch throughput; higher is better. Full Client stacks against the native Server.",
-             "Includes connection establishment and requests; excludes Client initialization and teardown.",
+             "Each batch includes request-state allocation, connection establishment, all response validation and normal task aggregation.",
+             "Runtime, certificate trust/TLS configuration, sockets/endpoints and addresses are prepared before timing.",
+             "Shutdown and result serialization are excluded.",
              "TLS: AES-128-GCM with X25519 on every Client and the Server.",
              "Each 1000-request batch starts with a fresh QPACK table; h3 supports static QPACK only.", ""]
 

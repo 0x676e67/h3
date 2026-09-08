@@ -85,7 +85,7 @@ jobs:
                 clients=(http3 nghttp3)
                 if [[ "$qpack" == none ]]; then clients=(http3 h3 nghttp3); fi
                 for client in "${clients[@]}"; do
-                  printf '%s/%s/server-nghttp3-native-3/requests-1000/concurrency-100/headers-%s/qpack-%s: benchmark\n' \
+                  printf '%s/%s/server-nghttp3-native-4/requests-1000/concurrency-100/headers-%s/qpack-%s: benchmark\n' \
                     "$client" "$body" "$headers" "$qpack"
                 done
               done
@@ -168,7 +168,9 @@ jobs:
           printf '%s\n' \
             'Client-only user CPU sampling; includes setup, teardown and diagnostic output.' \
             "Fixed native nghttp3/ngtcp2 Server; $PROFILE_BODY_BYTES B; headers=none; qpack=none; concurrency=100; 10 batches x 20000 requests per Client." \
-            'Rust Client stderr includes request-only Quinn counters; the before snapshot is inside the connection-inclusive timer.' \
+            'Client JSON uses one batch timer covering request-state allocation, connection establishment, all response validation and normal task aggregation.' \
+            'Runtime, certificate trust/TLS configuration, socket/address preparation, shutdown and result serialization are excluded from that timer.' \
+            'Rust Client stderr includes request-only Quinn counters; the before snapshot is inside the batch timer.' \
             'Sampled wall times are not throughput benchmark results.' > "$profile_dir/README.txt"
           control_dir=$(mktemp -d)
           mkfifo "$control_dir/stdin"
@@ -221,8 +223,8 @@ jobs:
                 exit 1
               fi
               jq -e --arg client "$client" --argjson body "$PROFILE_BODY_BYTES" '
-                .schema == "http3-client-bench-v14" and .http3_library == $client
-                and .measurement_profile == "connect-to-last-response"
+                .schema == "http3-client-bench-v15" and .http3_library == $client
+                and .measurement_profile == "connect-to-batch-complete"
                 and .qpack == "none"
                 and .requests == 20000 and .completed == 20000 and .in_flight == 100
                 and .request_headers == 0 and .response_headers == 0

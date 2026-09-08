@@ -174,10 +174,11 @@ fn run_groups(criterion: &mut Criterion, config: &Config, executable: &Path) -> 
                     );
                     continue;
                 }
-                // v3 fixes native wait precision and the shared request budget.
-                // Keep older scheduling, timer and Server baselines separate.
+                // v4 uses one batch timer, including request-state allocation,
+                // all response validation and normal task aggregation.
+                // Keep the older timer and Server baselines separate.
                 let mut group =
-                    criterion.benchmark_group(format!("{library}/{case}/server-nghttp3-native-3"));
+                    criterion.benchmark_group(format!("{library}/{case}/server-nghttp3-native-4"));
                 group.sampling_mode(SamplingMode::Flat);
                 if !config.test_mode && !config.sample_size_from_cli {
                     group.sample_size(10);
