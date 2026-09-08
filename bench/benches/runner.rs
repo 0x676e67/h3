@@ -92,6 +92,11 @@ impl Config {
 
 pub(crate) fn run(criterion: &mut Criterion) -> Result<()> {
     let config = Config::from_env()?;
+    if env::var_os("HTTP3_BENCH_NATIVE_TRACE").is_some_and(|value| value == "1")
+        && (!config.test_mode || criterion_arg_present("--bench"))
+    {
+        bail!("native transport tracing requires --test; traced timings are not benchmarks");
+    }
     let executable = env::current_exe().context("could not locate the benchmark executable")?;
     run_groups(criterion, &config, &executable)
 }

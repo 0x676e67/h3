@@ -113,6 +113,8 @@ impl ClientRunner<'_> {
     }
 
     fn run_once(&self, case: Case) -> Result<Duration> {
+        let trace_native =
+            std::env::var_os("HTTP3_BENCH_NATIVE_TRACE").is_some_and(|value| value == "1");
         let mut command = ChildRole::Client(self.library).command(self.executable);
         command
             .arg(case.requests.to_string())
@@ -123,7 +125,13 @@ impl ClientRunner<'_> {
             .current_dir(workspace_root())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            // Diagnostic records can exceed pipe capacity before wait_timeout
+            // returns. Stream them directly; ordinary failures stay captured.
+            .stderr(if trace_native {
+                Stdio::inherit()
+            } else {
+                Stdio::piped()
+            });
         let mut child = ChildCleanupGuard {
             child: Some(
                 command

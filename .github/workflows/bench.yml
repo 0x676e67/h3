@@ -18,6 +18,10 @@ on:
         description: Sample Client CPU stacks instead of comparing throughput
         type: boolean
         default: false
+      trace:
+        description: Trace native transport state only (takes precedence over profile)
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -72,7 +76,7 @@ jobs:
           CARGO_PROFILE_BENCH_DEBUG: ${{ inputs.profile && '1' || '0' }}
 
       - name: List benchmark cases through Linux launcher
-        if: ${{ !inputs.profile }}
+        if: ${{ !inputs.profile && !inputs.trace }}
         working-directory: ${{ runner.temp }}
         run: |
           for headers in none request response both; do
@@ -97,7 +101,7 @@ jobs:
           RUSTFLAGS: "-D warnings"
 
       - name: Smoke static and dynamic QPACK against native Server
-        if: ${{ !inputs.profile }}
+        if: ${{ !inputs.profile && !inputs.trace }}
         timeout-minutes: 5
         run: |
           # Repeated requests let the dynamic encoder receive table feedback
@@ -118,23 +122,23 @@ jobs:
       # Manual diagnostic: also vary all header and QPACK directions = 576.
       # Run sequentially against the same build; publish tables in Summary.
       - name: Concurrency 1
-        if: ${{ !inputs.profile }}
+        if: ${{ !inputs.profile && !inputs.trace }}
         run: bash bench/ci.sh 1
 
       - name: Concurrency 10
-        if: ${{ !inputs.profile }}
+        if: ${{ !inputs.profile && !inputs.trace }}
         run: bash bench/ci.sh 10
 
       - name: Concurrency 50
-        if: ${{ !inputs.profile }}
+        if: ${{ !inputs.profile && !inputs.trace }}
         run: bash bench/ci.sh 50
 
       - name: Concurrency 100
-        if: ${{ !inputs.profile }}
+        if: ${{ !inputs.profile && !inputs.trace }}
         run: bash bench/ci.sh 100
 
       - name: Upload benchmark measurements
-        if: ${{ always() && !inputs.profile }}
+        if: ${{ always() && !inputs.profile && !inputs.trace }}
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-${{ env.HTTP3_BENCH_SUITE }}
@@ -142,8 +146,41 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      - name: Trace native transport state
+        if: ${{ inputs.trace }}
+        shell: bash
+        timeout-minutes: 5
+        env:
+          HTTP3_BENCH_NATIVE_TRACE: "1"
+          HTTP3_BENCH_HEADERS: both
+          HTTP3_BENCH_REQUESTS: "1000"
+        run: |
+          # Functional batches only: trace collection affects execution timing.
+          # Each Client uses the same Server; record Server state for Rust too.
+          for workload in '1KiB 10' '10KiB 1'; do
+            read -r HTTP3_BENCH_BODY_SIZES HTTP3_BENCH_CONCURRENCY <<< "$workload"
+            export HTTP3_BENCH_BODY_SIZES HTTP3_BENCH_CONCURRENCY
+            for HTTP3_BENCH_QPACK in none both; do
+              export HTTP3_BENCH_QPACK
+              for repeat in 1 2 3; do
+                printf 'TRACE_CASE body=%s concurrency=%s qpack=%s repeat=%s\n' \
+                  "$HTTP3_BENCH_BODY_SIZES" "$HTTP3_BENCH_CONCURRENCY" "$HTTP3_BENCH_QPACK" "$repeat"
+                "$BENCH_EXE" --test
+              done
+            done
+          done 2>&1 | tee "$RUNNER_TEMP/native-transport-trace.log"
+
+      - name: Upload native transport trace
+        if: ${{ always() && inputs.trace }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-transport-trace
+          path: ${{ runner.temp }}/native-transport-trace.log
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Install Linux perf
-        if: ${{ inputs.profile }}
+        if: ${{ inputs.profile && !inputs.trace }}
         run: |
           sudo apt-get install -y linux-tools-common linux-tools-generic
           # Use the packaged binary directly: the runner kernel need not match
@@ -155,7 +192,7 @@ jobs:
           sudo sysctl kernel.perf_event_paranoid=2
 
       - name: Sample Client CPU stacks against fixed Server
-        if: ${{ inputs.profile }}
+        if: ${{ inputs.profile && !inputs.trace }}
         timeout-minutes: 15
         env:
           BENCH_EXE: ${{ steps.build.outputs.executable }}
@@ -248,7 +285,7 @@ jobs:
           done
 
       - name: Upload Client CPU profiles
-        if: ${{ always() && inputs.profile }}
+        if: ${{ always() && inputs.profile && !inputs.trace }}
         uses: actions/upload-artifact@v4
         with:
           name: http3-client-cpu-profiles

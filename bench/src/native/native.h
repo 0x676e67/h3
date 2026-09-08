@@ -198,6 +198,7 @@ typedef struct udp_endpoint udp_endpoint;
 typedef struct server_state server_state;
 typedef struct server_stream server_stream;
 typedef struct server_cid server_cid;
+typedef struct native_trace native_trace;
 
 typedef enum rx_drain_result {
   RX_DRAIN_FAILED = -1,
@@ -278,6 +279,7 @@ struct client {
   client *next;
   server_stream *streams;
   server_cid *cids;
+  native_trace *trace;
   ngtcp2_cid initial_dcid;
   bool closed;
   uint64_t close_deadline_ns;
