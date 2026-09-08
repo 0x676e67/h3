@@ -108,10 +108,11 @@ async fn run_client<A: Adapter>(
     // is excluded. Include this connection's TLS/QUIC handshake and HTTP/3 setup,
     // batch bookkeeping, requests and joining the completed request workers.
     let benchmark_started = Instant::now();
-    let connection = connect::<A>(&endpoint, server_addr, qpack).await?;
-    let driver = connection.driver;
-    let quic_connection = connection.quic_connection;
-    let sender_guard = connection.sender;
+    let ReadyConnection {
+        sender: sender_guard,
+        driver,
+        quic_connection,
+    } = connect::<A>(&endpoint, server_addr, qpack).await?;
     // Optional profiling captures request counters before spawning workers.
     // Its snapshot is inside the timer, so profiling timings are diagnostic only.
     let stats_before = collect_stats.then(|| quic_connection.stats());

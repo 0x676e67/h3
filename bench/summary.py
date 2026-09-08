@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate one CI concurrency matrix and print median-throughput Markdown."""
+"""Validate one CI concurrency matrix and print throughput and pairwise differences."""
 
 import argparse
 import json
@@ -17,6 +17,7 @@ CONCURRENCY = (1, 10, 50, 100)
 HEADERS = ("none", "request", "response", "both")
 QPACK = ("none", "request", "response", "both")
 CLIENTS = ("http3", "h3", "nghttp3")
+PAIRS = (("http3", "h3"), ("http3", "nghttp3"), ("h3", "nghttp3"))
 
 
 def expected_cases(body, suite, concurrency=None):
@@ -83,12 +84,27 @@ def render(values, concurrency, suite):
              "Runtime, certificate trust/TLS configuration, sockets/endpoints and addresses are prepared before timing.",
              "Shutdown and result serialization are excluded.",
              "TLS: AES-128-GCM with X25519 on every Client and the Server.",
-             "Each 1000-request batch starts with a fresh QPACK table; h3 supports static QPACK only.", ""]
+             "Each 1000-request batch starts with a fresh QPACK table; h3 supports static QPACK only.",
+             "Percentages = (left Client throughput / right Client throughput - 1) × 100%; positive favors the left Client.",
+             "Percentages use unrounded values; small differences do not establish statistical significance.", ""]
 
     def value(body, client, header, mode):
         if client == "h3" and mode != "none":
             return "—"
         return f"{values[body][client, concurrency, header, mode]:.2f}"
+
+    def differences(body, header, mode):
+        cells = []
+        for client, baseline in PAIRS:
+            if mode != "none" and "h3" in (client, baseline):
+                cells.append("—")
+                continue
+            # Compare unrounded rates, not elapsed times: the reciprocal would
+            # reverse both the direction and magnitude of a throughput change.
+            rate = values[body][client, concurrency, header, mode]
+            reference = values[body][baseline, concurrency, header, mode]
+            cells.append(f"{(rate / reference - 1) * 100:+.1f}%")
+        return cells
 
     def row_label(body):
         label, body_bytes = BODIES[body]
@@ -98,24 +114,25 @@ def render(values, concurrency, suite):
         return f"{label} | {unit}"
 
     if suite == "comparison":
-        lines += ["Headers: both. Static = qpack none; dynamic = qpack both.", "",
-                  "| Body | Unit | http3 static | http3 dynamic | h3 static | nghttp3 static | nghttp3 dynamic |",
-                  "|---|---|---:|---:|---:|---:|---:|"]
-        for body in BODIES:
-            cells = [value(body, client, "both", mode)
-                     for client, mode in (("http3", "none"), ("http3", "both"),
-                                          ("h3", "none"), ("nghttp3", "none"), ("nghttp3", "both"))]
-            lines.append(f"| {row_label(body)} | " + " | ".join(cells) + " |")
+        lines += ["Headers: both. Static = qpack none; dynamic = qpack both.", ""]
+        headers = ("both",)
+        modes = (("none", "static"), ("both", "dynamic"))
     else:
         lines += ["QPACK: none = static; request/response/both select dynamic directions.", ""]
-        for header in HEADERS:
-            lines += [f"### Headers: {header}", "",
-                      "| Body | Unit | QPACK | http3 | h3 | nghttp3 |", "|---|---|---|---:|---:|---:|"]
-            for body in BODIES:
-                for mode in QPACK:
-                    cells = [value(body, client, header, mode) for client in CLIENTS]
-                    lines.append(f"| {row_label(body)} | {mode} | " + " | ".join(cells) + " |")
-            lines.append("")
+        headers = HEADERS
+        modes = tuple((mode, mode) for mode in QPACK)
+    pair_columns = " | ".join(f"{client} vs {baseline}" for client, baseline in PAIRS)
+    for header in headers:
+        if suite != "comparison":
+            lines += [f"### Headers: {header}", ""]
+        lines += [f"| Body | Unit | QPACK | http3 | h3 | nghttp3 | {pair_columns} |",
+                  "|---|---|---|---:|---:|---:|---:|---:|---:|"]
+        for body in BODIES:
+            for mode, label in modes:
+                cells = [value(body, client, header, mode) for client in CLIENTS]
+                cells += differences(body, header, mode)
+                lines.append(f"| {row_label(body)} | {label} | " + " | ".join(cells) + " |")
+        lines.append("")
     return "\n".join(lines).rstrip()
 
 
