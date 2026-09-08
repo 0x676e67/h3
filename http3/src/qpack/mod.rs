@@ -46,6 +46,10 @@ pub enum Error {
     Decoder(DecoderError),
 }
 
+/// Encoder state and its instruction-queue tail, mutated under one lock.
+///
+/// Table insertions and their wire instructions must become visible together:
+/// feedback must never observe an insertion from a partially encoded batch.
 #[derive(Default)]
 struct QpackEncoderState {
     encoder: Encoder,
@@ -57,7 +61,26 @@ struct QpackEncoderState {
     enabled: bool,
 }
 
-/// Connection-shared request encoder with an opt-in dynamic table.
+/// Shared QPACK state for encoding a connection's initial request HEADERS.
+///
+/// Request tasks encode field sections; the connection driver applies peer
+/// decoder-stream feedback and drains local encoder-stream instructions. Clones
+/// share the same table, reference tracking and instruction queue. The default
+/// Client path calls [`encode_stateless`] directly, without taking this lock.
+///
+/// Dynamic encoding is opt-in and starts after [`Self::configure`] applies the
+/// peer's SETTINGS. Inserts may prewarm the table, but transmitted field sections
+/// reference only entries covered by the Known Received Count. Otherwise the
+/// field section falls back to stateless encoding without retracting inserts.
+/// Thus this policy does not consume the peer's blocked-stream allowance.
+///
+/// Unlike [`QpackDecoder`], encoding mutates reference tracking even on table
+/// hits. These updates, feedback and queued instructions require exclusive
+/// access. Each method acquires a synchronous mutex and may wait for another
+/// caller; none retains a guard across an await, transport poll or driver wakeup.
+/// Callers perform I/O and wake the driver only after the method returns.
+///
+/// See [RFC 9204, Sections 2.1.2 and 2.1.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2).
 #[derive(Clone, Default)]
 pub(crate) struct QpackEncoder {
     state: Arc<Mutex<QpackEncoderState>>,
@@ -89,11 +112,32 @@ impl QpackEncoder {
         self.state.lock().map_err(|_| QpackEncoderError::Poisoned)
     }
 
-    pub(crate) fn dynamic_ready(&self) -> Result<bool, QpackEncoderError> {
+    /// Checks whether dynamic encoding is enabled and the shared queue is empty.
+    ///
+    /// This is a snapshot, not a reservation: another request can queue output
+    /// before [`Self::encode`] runs, so that method checks the state again. An
+    /// earlier batch may still be held by the driver or transport.
+    ///
+    /// Returns an error if the encoder mutex is poisoned.
+    pub(crate) fn ready(&self) -> Result<bool, QpackEncoderError> {
         let state = self.lock()?;
         Ok(state.enabled && state.pending.is_empty())
     }
 
+    /// Initializes dynamic encoding after the first peer SETTINGS is accepted.
+    ///
+    /// `max_table_capacity` is the peer's advertised maximum, used for Required
+    /// Insert Count wrapping; `capacity` is the locally chosen value within that
+    /// maximum. A zero capacity is a no-op, not a runtime disable operation.
+    /// The driver takes the queued capacity instruction before insertions can
+    /// be generated; later batches must follow it on the encoder stream. This
+    /// method does not send bytes or wake the driver.
+    ///
+    /// Returns an error for invalid capacity settings or a poisoned mutex; the
+    /// caller must terminate the connection rather than retry initialization.
+    ///
+    /// See [RFC 9204, Sections 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3)
+    /// and [4.5.1.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1).
     pub(crate) fn configure(
         &self,
         max_table_capacity: usize,
@@ -118,9 +162,24 @@ impl QpackEncoder {
         Ok(())
     }
 
-    /// Encodes one request field section and commits any encoder-stream output.
-    /// An error is terminal for this encoder state and the caller must close the
-    /// connection with a local error.
+    /// Appends an initial request field section and commits encoder instructions.
+    ///
+    /// `stream_id` must identify a new request stream with no earlier encoded
+    /// field sections. The caller checks the peer's field-section size limit
+    /// before calling; cloned `fields` must yield the same fields for fallback.
+    /// This API is not a trailers encoder: fallback cancels tracking for the
+    /// entire stream before replacing the speculative section with stateless
+    /// output. Insertions remain queued to prewarm the peer's dynamic table.
+    ///
+    /// Returns `true` when instructions were queued and the caller should wake
+    /// the driver. `false` does not imply stateless output: an acknowledged table
+    /// hit can produce a dynamic section without new instructions. Once this
+    /// method succeeds, a canceled HEADERS write must not roll back references;
+    /// the peer may already have received bytes and can still acknowledge them.
+    ///
+    /// On encoding or lock failure, discard the field-section output and close
+    /// the connection with a local error. Table mutations are not transactional;
+    /// this state must not be reused after an error.
     pub(crate) fn encode<'a, T, H>(
         &self,
         stream_id: StreamId,
@@ -158,6 +217,9 @@ impl QpackEncoder {
                 }
             };
         if encoder.field_section_is_blocked(required_insert_count) {
+            // Keep the insertions, but remove this unsent section's references.
+            // Only a fresh request stream is safe here: cancel_stream releases
+            // every tracked section on the stream, not just the latest one.
             if let Err(error) = encoder.cancel_stream(stream_id.into_inner()) {
                 block.truncate(block_start);
                 pending.clear();
@@ -174,15 +236,32 @@ impl QpackEncoder {
         Ok(!pending.is_empty())
     }
 
-    /// Takes the next instruction batch. The caller must completely write a
-    /// previously taken batch before taking another so stream order is kept.
-    /// The returned bytes remain part of the committed, non-retractable local
-    /// encoder-stream output queue while the transport consumes them.
+    /// Transfers the next instruction batch to the connection driver.
+    ///
+    /// Returns empty bytes when no new output is queued. The sole driver must
+    /// completely write a previously taken batch before taking another, and
+    /// retain its unsent suffix across [`Poll::Pending`]. Taking a batch releases
+    /// the mutex before I/O and allows request tasks to queue the next batch.
+    /// The returned bytes remain committed, non-retractable encoder-stream
+    /// output; taking them is not evidence that the peer has received them.
+    ///
+    /// Returns an error if the encoder mutex is poisoned.
     pub(crate) fn take_pending_instructions(&self) -> Result<Bytes, QpackEncoderError> {
         let mut state = self.lock()?;
         Ok(state.pending.split().freeze())
     }
 
+    /// Applies complete instructions from the peer's QPACK decoder stream.
+    ///
+    /// `read.clone()` must provide an independent cursor over the same buffered
+    /// bytes. A trailing partial instruction stays unread for the next call;
+    /// complete instructions advance reference tracking and Known Received Count.
+    ///
+    /// Invalid feedback is a peer QPACK decoder-stream error; a poisoned mutex
+    /// is a local error. Earlier applied instructions are not rolled back on
+    /// failure, and the driver must close the connection in either case.
+    ///
+    /// See [RFC 9204, Section 4.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4).
     pub(crate) fn on_decoder_recv_buffered<R: Buf + Clone>(
         &self,
         read: &mut R,

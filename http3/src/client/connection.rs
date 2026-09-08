@@ -208,7 +208,7 @@ where
         //# more cookie-pairs, before compression.
 
         let dynamic_encoder = match self.encoder.as_ref() {
-            Some(encoder) => match encoder.dynamic_ready() {
+            Some(encoder) => match encoder.ready() {
                 Ok(true) => Some(encoder),
                 Ok(false) => None,
                 Err(error) => {
@@ -513,7 +513,7 @@ where
             return Poll::Ready(err);
         }
 
-        while let Poll::Ready(result) = self.inner.poll_control(cx) {
+        while let Poll::Ready(result) = self.inner.poll_accepted_control(cx) {
             match result {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
                 //= type=TODO

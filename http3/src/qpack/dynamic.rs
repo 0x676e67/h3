@@ -65,6 +65,11 @@ impl<'a> DynamicTableDecoder<'a> {
     }
 }
 
+/// Reference guard for encoding one field section against a fixed Base.
+///
+/// Lookups pin entries against eviction. A successful non-zero-RIC commit moves
+/// those pins to the table's acknowledgment queue; otherwise Drop releases them.
+/// Insertions themselves are not rolled back when the guard is dropped.
 pub struct DynamicTableEncoder<'a> {
     table: &'a mut DynamicTable,
     base: usize,
@@ -94,15 +99,16 @@ impl<'a> DynamicTableEncoder<'a> {
     }
 
     pub(super) fn commit(&mut self, required_insert_count: usize) {
-        // A zero Required Insert Count never produces a Section
-        // Acknowledgment, so only dynamic field sections belong in this queue.
+        // A zero Required Insert Count never produces a Section Acknowledgment.
+        // Leave any speculative pins owned by this guard for Drop to release;
+        // marking it committed would keep entries pinned without a future ACK.
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
         if required_insert_count != 0 {
             let refs = std::mem::take(&mut self.block_refs);
             self.table
                 .track_block(self.stream_id, required_insert_count, refs);
+            self.committed = true;
         }
-        self.committed = true;
     }
 
     pub(super) fn find(&mut self, field: &HeaderField<'_>) -> DynamicLookupResult {
@@ -1543,6 +1549,16 @@ mod tests {
             table.acknowledge_section(42),
             Err(Error::UnknownStreamId(42))
         );
+
+        table.put(HeaderField::new("name", "value")).unwrap();
+        table.update_largest_received(1).unwrap();
+        let mut encoder = table.encoder(42);
+        encoder.track_ref(1);
+        encoder.commit(0);
+        drop(encoder);
+        assert!(table.track_map.is_empty());
+        assert!(table.track_blocks.is_empty());
+        assert_eq!(table.can_free(table.max_size), Ok(Some(1)));
     }
 
     #[test]

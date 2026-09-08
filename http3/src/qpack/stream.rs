@@ -130,15 +130,22 @@ impl InsertWithNameRef {
     pub fn encode<W: BufMut>(&self, buf: &mut W) -> Result<(), prefix_string::Error> {
         match self {
             InsertWithNameRef::Static { index, value } => {
-                prefix_int::encode(6, 0b11, *index as u64, buf);
-                prefix_string::encode(8, 0, value, buf)?;
+                Self::encode_parts(*index, value, true, buf)
             }
             InsertWithNameRef::Dynamic { index, value } => {
-                prefix_int::encode(6, 0b10, *index as u64, buf);
-                prefix_string::encode(8, 0, value, buf)?;
+                Self::encode_parts(*index, value, false, buf)
             }
         }
-        Ok(())
+    }
+
+    pub(crate) fn encode_parts<W: BufMut>(
+        index: usize,
+        value: &[u8],
+        is_static: bool,
+        buf: &mut W,
+    ) -> Result<(), prefix_string::Error> {
+        prefix_int::encode(6, if is_static { 0b11 } else { 0b10 }, index as u64, buf);
+        prefix_string::encode(8, 0, value, buf)
     }
 }
 
@@ -178,9 +185,16 @@ impl InsertWithoutNameRef {
     }
 
     pub fn encode<W: BufMut>(&self, buf: &mut W) -> Result<(), prefix_string::Error> {
-        prefix_string::encode(6, 0b01, &self.name, buf)?;
-        prefix_string::encode(8, 0, &self.value, buf)?;
-        Ok(())
+        Self::encode_parts(&self.name, &self.value, buf)
+    }
+
+    pub(crate) fn encode_parts<W: BufMut>(
+        name: &[u8],
+        value: &[u8],
+        buf: &mut W,
+    ) -> Result<(), prefix_string::Error> {
+        prefix_string::encode(6, 0b01, name, buf)?;
+        prefix_string::encode(8, 0, value, buf)
     }
 }
 

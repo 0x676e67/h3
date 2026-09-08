@@ -653,6 +653,9 @@ impl DecodeIter<'_> {
 impl Iterator for DecodeIter<'_> {
     type Item = Result<u8, Error>;
 
+    // Keep per-symbol state in the shared whole-string loop, instead of
+    // returning through an out-of-line Iterator call for every decoded byte.
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         if self.finished {
             return None;
@@ -685,6 +688,18 @@ impl Iterator for DecodeIter<'_> {
             Decoded::Incomplete => self.finish_tail(),
         }
     }
+}
+
+// Keep the output loop shared by the different QPACK input buffer types.
+pub(super) fn decode(content: &[u8]) -> Result<Vec<u8>, Error> {
+    // Huffman codes use at least five bits per byte: 40 input bytes need at most
+    // 64 output bytes. Cap only the initial reservation, not the decoded length;
+    // the Vec grows as needed instead of trusting a large compressed length.
+    let mut decoded = Vec::with_capacity(content.len().min(40) * 8 / 5);
+    for byte in content.hpack_decode() {
+        decoded.push(byte?);
+    }
+    Ok(decoded)
 }
 
 pub trait HpackStringDecode {
@@ -1092,15 +1107,12 @@ mod tests {
 
     #[test]
     fn fast_decoder_matches_recursive_oracle_for_short_inputs() {
-        assert_eq!(
-            <[u8]>::hpack_decode(&[]).collect::<Result<Vec<_>, _>>(),
-            oracle::decode(&[])
-        );
+        assert_eq!(decode(&[]), oracle::decode(&[]));
 
         for value in 0u16..=u16::MAX {
             let bytes = value.to_be_bytes();
             for encoded in [&bytes[..1], &bytes[..]] {
-                let decoded: Result<Vec<_>, Error> = encoded.hpack_decode().collect();
+                let decoded = decode(encoded);
                 assert_eq!(decoded, oracle::decode(encoded), "input {encoded:02x?}");
             }
         }

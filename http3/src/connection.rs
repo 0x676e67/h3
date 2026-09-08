@@ -58,6 +58,15 @@ where
     }
 }
 
+/// Connection-driver ownership of the two directional QPACK stream pairs.
+///
+/// Local encoder output and peer decoder feedback belong to `encoder`; peer
+/// encoder instructions and local decoder feedback belong to `decoder`. Request
+/// tasks share codec handles, but only this driver polls the critical streams,
+/// drains decoder events and owns the blocked-field-section registry.
+///
+/// Encoder output is FIFO across the active `encoder_send_buf` and the shared
+/// encoder's queued tail. Neither codec lock is held while polling transport I/O.
 pub(crate) struct QpackStreams<C, B>
 where
     C: quic::Connection<B>,
@@ -880,9 +889,11 @@ where
 
     /// Drives both peer QPACK streams and flushes locally generated instructions.
     ///
-    /// Each direction remains an independent critical-stream state machine. A
-    /// pending direction registers its own wakeup and does not prevent the other
-    /// directions from making progress.
+    /// Pending encoder output does not prevent peer decoder feedback or the
+    /// receive-side decoder from progressing. One deliberate dependency remains:
+    /// peer encoder input waits for local decoder output to drain, bounding
+    /// feedback buffered while the decoder stream is flow-control blocked.
+    /// Each pending stage registers the wakeup needed to resume it.
     ///
     /// See [RFC 9204, Sections 4.2-4.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.2).
     pub(crate) fn poll_qpack(&mut self, cx: &mut Context<'_>) -> Result<(), ConnectionError>
@@ -1061,16 +1072,35 @@ where
     ) -> Poll<Result<Frame<PayloadLen>, ConnectionError>> {
         // check if a connection error occurred on a stream
         let _ = self.poll_connection_error(cx)?;
+        self.poll_accept_recv(cx)?;
 
-        let recv = {
-            // TODO
-            self.poll_accept_recv(cx)?;
-            if let Some(v) = &mut self.control_recv {
-                v
-            } else {
-                // Try later
-                return Poll::Pending;
-            }
+        self.poll_control_frame(cx)
+    }
+
+    /// Reads the control stream after the caller has polled incoming streams.
+    ///
+    /// The caller must first drain `poll_accept_recv` to register the transport
+    /// wakeup for new streams, including when no control stream exists yet.
+    /// Keeping that accept pass outside the control-frame loop avoids polling
+    /// the same incoming-stream queue again for each buffered frame.
+    /// Returns a decoded frame, waits for the stream or its data, or reports the
+    /// same connection errors as `poll_control`.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub(crate) fn poll_accepted_control(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Frame<PayloadLen>, ConnectionError>> {
+        let _ = self.poll_connection_error(cx)?;
+
+        self.poll_control_frame(cx)
+    }
+
+    fn poll_control_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Frame<PayloadLen>, ConnectionError>> {
+        let Some(recv) = &mut self.control_recv else {
+            return Poll::Pending;
         };
 
         let res = match ready!(recv.poll_next(cx)) {

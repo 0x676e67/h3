@@ -4,7 +4,7 @@ use std::{
 };
 
 /**
- * https://tools.ietf.org/html/rfc7541
+ * <https://tools.ietf.org/html/rfc7541>
  * 4.1.  Calculating Table Size
  */
 pub const ESTIMATED_OVERHEAD_BYTES: usize = 32;
