@@ -653,8 +653,6 @@ impl DecodeIter<'_> {
 impl Iterator for DecodeIter<'_> {
     type Item = Result<u8, Error>;
 
-    // Keep per-symbol state in the shared whole-string loop, instead of
-    // returning through an out-of-line Iterator call for every decoded byte.
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         if self.finished {
@@ -667,6 +665,8 @@ impl Iterator for DecodeIter<'_> {
             return None;
         }
 
+        // Keep per-symbol state in the shared whole-string loop, instead of
+        // returning through an out-of-line Iterator call for every decoded byte.
         match decode_symbol(self.bits, self.bit_count) {
             Decoded::Symbol {
                 symbol: EOS_SYMBOL, ..

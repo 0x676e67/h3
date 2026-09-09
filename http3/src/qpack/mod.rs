@@ -238,17 +238,24 @@ impl QpackEncoder {
 
     /// Transfers the next instruction batch to the connection driver.
     ///
-    /// Returns empty bytes when no new output is queued. The sole driver must
-    /// completely write a previously taken batch before taking another, and
-    /// retain its unsent suffix across [`Poll::Pending`]. Taking a batch releases
-    /// the mutex before I/O and allows request tasks to queue the next batch.
+    /// Returns `None` when no new output is queued, otherwise a non-empty batch.
+    /// The sole driver must finish and drop the previous batch before taking
+    /// another. Across [`Poll::Pending`], it must retain any unsent suffix.
+    /// Dropping a consumed batch releases its shared storage reference. Taking
+    /// a batch releases the mutex before I/O and allows request tasks to queue
+    /// the next batch.
     /// The returned bytes remain committed, non-retractable encoder-stream
     /// output; taking them is not evidence that the peer has received them.
     ///
     /// Returns an error if the encoder mutex is poisoned.
-    pub(crate) fn take_pending_instructions(&self) -> Result<Bytes, QpackEncoderError> {
+    pub(crate) fn take_pending_instructions(&self) -> Result<Option<Bytes>, QpackEncoderError> {
         let mut state = self.lock()?;
-        Ok(state.pending.split().freeze())
+        // Even an empty split can share the allocation and prevent the queue
+        // from reclaiming its consumed prefix. Do not create that extra handle.
+        if state.pending.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(state.pending.split().freeze()))
     }
 
     /// Applies complete instructions from the peer's QPACK decoder stream.
@@ -700,6 +707,7 @@ mod shared_encoder_tests {
     #[test]
     fn dynamic_encoder_waits_for_settings_instructions_to_drain() {
         let encoder = QpackEncoder::default();
+        assert!(encoder.take_pending_instructions().unwrap().is_none());
         encoder.configure(256, 256).unwrap();
 
         let mut stateless = BytesMut::new();
@@ -717,11 +725,17 @@ mod shared_encoder_tests {
             Ok((0, 0))
         );
 
-        let mut instructions = Cursor::new(encoder.take_pending_instructions().unwrap());
+        let capacity = encoder.lock().unwrap().pending.capacity();
+        let mut instructions = Cursor::new(encoder.take_pending_instructions().unwrap().unwrap());
         assert_eq!(
             DynamicTableSizeUpdate::decode(&mut instructions),
             Ok(Some(DynamicTableSizeUpdate(256)))
         );
+        assert!(encoder.take_pending_instructions().unwrap().is_none());
+        // Taking an empty queue must not keep an extra shared view alive after
+        // the driver releases its batch, otherwise this prefix is not reusable.
+        drop(instructions);
+        assert!(encoder.lock().unwrap().pending.try_reclaim(capacity));
 
         let mut prewarm = BytesMut::new();
         let encoder_instructions_queued = encoder
@@ -739,7 +753,7 @@ mod shared_encoder_tests {
             Ok((0, 0))
         );
 
-        let _instructions = encoder.take_pending_instructions().unwrap();
+        let _instructions = encoder.take_pending_instructions().unwrap().unwrap();
         let mut increment = Vec::new();
         InsertCountIncrement(1).encode(&mut increment);
         encoder
