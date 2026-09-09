@@ -117,6 +117,22 @@ jobs:
         env:
           RUSTFLAGS: "-D warnings"
 
+      # Each step has its own summary file; write the shared notes once before
+      # the concurrency steps append their tables to the job summary.
+      - name: Benchmark summary
+        if: ${{ !inputs.profile && !inputs.trace }}
+        run: |
+          printf '%s\n' \
+            'Median batch throughput; higher is better. Full Client stacks against the native Server.' \
+            'Each batch includes request-state allocation, connection establishment, all response validation and normal task aggregation.' \
+            'Runtime, certificate trust/TLS configuration, sockets/endpoints and addresses are prepared before timing.' \
+            'Shutdown and result serialization are excluded.' \
+            'TLS: AES-128-GCM with X25519 on every Client and the Server.' \
+            'Each 1000-request batch starts with a fresh QPACK table; h3 supports static QPACK only.' \
+            'Percentages = (left Client throughput / right Client throughput - 1) × 100%; positive favors the left Client.' \
+            'Percentages use unrounded values; small differences do not establish statistical significance.' \
+            '' >> "$GITHUB_STEP_SUMMARY"
+
       # Compare all body sizes in one step per concurrency level.
       # Default: 4 bodies x 4 concurrency levels x (3 static + 2 dynamic) = 80.
       # Manual diagnostic: also vary all header and QPACK directions = 576.

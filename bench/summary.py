@@ -78,15 +78,7 @@ def read_results(root, body, suite, concurrency=None):
 
 
 def render(values, concurrency, suite):
-    lines = [f"## Concurrency {concurrency}: {suite}", "",
-             "Median batch throughput; higher is better. Full Client stacks against the native Server.",
-             "Each batch includes request-state allocation, connection establishment, all response validation and normal task aggregation.",
-             "Runtime, certificate trust/TLS configuration, sockets/endpoints and addresses are prepared before timing.",
-             "Shutdown and result serialization are excluded.",
-             "TLS: AES-128-GCM with X25519 on every Client and the Server.",
-             "Each 1000-request batch starts with a fresh QPACK table; h3 supports static QPACK only.",
-             "Percentages = (left Client throughput / right Client throughput - 1) × 100%; positive favors the left Client.",
-             "Percentages use unrounded values; small differences do not establish statistical significance.", ""]
+    lines = [f"## Concurrency {concurrency}: {suite}", ""]
 
     def value(body, client, header, mode):
         if client == "h3" and mode != "none":
