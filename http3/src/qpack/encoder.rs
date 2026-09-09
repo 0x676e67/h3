@@ -77,6 +77,16 @@ impl Encoder {
         total > 0 && self.table.is_known_received(total)
     }
 
+    /// Returns whether a field section could block at the peer decoder.
+    ///
+    /// `required_insert_count` is the absolute count returned by [`Self::encode`],
+    /// not its modulo-encoded wire value. A count greater than the encoder's
+    /// Known Received Count returns `true`; zero always returns `false`.
+    /// This checks current feedback without waiting or changing table state;
+    /// it does not prove that the peer is actually blocked.
+    ///
+    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2)
+    /// and [Section 2.1.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.4).
     pub(super) fn field_section_is_blocked(&self, required_insert_count: usize) -> bool {
         !self.table.is_known_received(required_insert_count)
     }
