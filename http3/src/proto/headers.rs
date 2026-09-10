@@ -658,7 +658,6 @@ pub enum HeaderError {
     MissingStatus,
     MissingAuthority,
     ContradictedAuthority,
-    /// The decoded field section exceeds the local HeaderMap capacity.
     TooManyFields,
 }
 
