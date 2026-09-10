@@ -36,9 +36,8 @@ pub(super) fn encoded_len(value: &[u8]) -> Result<usize, Error> {
     let mut pending_bits = 0usize;
 
     for chunk in value.chunks(64) {
-        // A code uses at most 30 bits (RFC 7541 Appendix B). Summing a
-        // bounded chunk cannot overflow, even on 32-bit targets, and avoids
-        // carrying byte counts and padding through every input byte.
+        // At most 64 * 30 + 7 bits fit even on 32-bit targets. Keep overflow
+        // checks on the accumulated byte count, not on each input symbol.
         let bit_count = pending_bits
             + chunk
                 .iter()
@@ -1768,6 +1767,21 @@ mod tests {
     use super::super::HpackStringDecode;
 
     #[test]
+    fn encoded_length_matches_output_at_chunk_boundaries() {
+        for len in [0, 1, 63, 64, 65, 127, 128, 129, 256, 1025] {
+            let value: Vec<u8> = (0..=255).cycle().take(len).collect();
+            let mut encoded = Vec::new();
+            super::encode_into(&value, &mut encoded);
+            let bits: usize = value
+                .iter()
+                .map(|byte| usize::from(super::ENCODE_CODE_LENGTHS[usize::from(*byte)]))
+                .sum();
+            assert_eq!(super::encoded_len(&value), Ok(bits.div_ceil(8)));
+            assert_eq!(encoded.len(), bits.div_ceil(8));
+        }
+    }
+
+    #[test]
     fn byte_count_exact_when_bit_count_multiple_of_8() {
         let encoded = vec![
             0x8c, 0x2d, 0x4b, 0x70, 0xdd, 0xf4, 0x5a, 0xbe, 0xfb, 0x40, 0x05, 0xdb,
@@ -1781,21 +1795,6 @@ mod tests {
         let reencoded = res.hpack_encode();
 
         assert_eq!(reencoded.unwrap().last(), Some(&0xdb));
-    }
-
-    #[test]
-    fn encoded_length_matches_output_at_chunk_boundaries() {
-        for len in [0, 1, 63, 64, 65, 127, 128, 129, 256, 1025] {
-            let value: Vec<u8> = (0..=255).cycle().take(len).collect();
-            let mut encoded = Vec::new();
-            super::encode_into(&value, &mut encoded);
-            let bits: usize = value
-                .iter()
-                .map(|byte| usize::from(super::ENCODE_CODE_LENGTHS[usize::from(*byte)]))
-                .sum();
-            assert_eq!(super::encoded_len(&value), Ok(bits.div_ceil(8)));
-            assert_eq!(encoded.len(), bits.div_ceil(8));
-        }
     }
 
     #[test]

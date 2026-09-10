@@ -1,10 +1,10 @@
 use std::{
     convert::TryFrom,
+    future::poll_fn,
     task::{Context, Poll},
 };
 
 use bytes::Buf;
-use futures_util::future;
 use http::{HeaderMap, Response};
 use quic::StreamId;
 #[cfg(feature = "tracing")]
@@ -109,7 +109,7 @@ where
         //# mismatch, it MUST respond with a connection error of type
         //# H3_GENERAL_PROTOCOL_ERROR.
 
-        let decoded = future::poll_fn(|cx| self.inner.poll_recv_response_headers(cx)).await?;
+        let decoded = poll_fn(|cx| self.inner.poll_recv_response_headers(cx)).await?;
 
         let qpack::Decoded { fields, .. } = decoded;
 
@@ -129,6 +129,7 @@ where
                     reason: "Received malformed header".to_string(),
                 }
             })?;
+
         let mut resp = Response::new(());
         *resp.status_mut() = status;
         *resp.headers_mut() = headers;
@@ -144,7 +145,7 @@ where
     // TODO what if called before recv_response ?
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_data(&mut self) -> Result<Option<impl Buf + use<S, B>>, StreamError> {
-        future::poll_fn(|cx| self.poll_recv_data(cx)).await
+        poll_fn(|cx| self.poll_recv_data(cx)).await
     }
 
     /// Receive request body
@@ -158,7 +159,7 @@ where
     /// Receive an optional set of trailers for the response.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_trailers(&mut self) -> Result<Option<HeaderMap>, StreamError> {
-        future::poll_fn(|cx| self.poll_recv_trailers(cx)).await
+        poll_fn(|cx| self.poll_recv_trailers(cx)).await
     }
 
     /// Poll receive an optional set of trailers for the response.

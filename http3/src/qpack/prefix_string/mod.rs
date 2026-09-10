@@ -10,11 +10,10 @@ use bytes::{Buf, BufMut};
 #[cfg(test)]
 pub use self::bitwin::BitWindow;
 #[cfg(test)]
+pub use self::decode::HpackStringDecode;
+#[cfg(test)]
 pub use self::encode::HpackStringEncode;
-pub use self::{
-    decode::{Error as HuffmanDecodingError, HpackStringDecode},
-    encode::Error as HuffmanEncodingError,
-};
+pub use self::{decode::Error as HuffmanDecodingError, encode::Error as HuffmanEncodingError};
 use crate::qpack::prefix_int::{self, Error as IntegerError};
 
 #[derive(Debug, PartialEq)]
@@ -64,24 +63,23 @@ pub(crate) fn decode_limited<B: Buf>(
         return Err(Error::UnexpectedEnd);
     }
 
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+
     let decode_payload = |payload: &[u8]| -> Result<Vec<u8>, Error> {
         if flags & 1 == 0 {
-            return Ok(payload.to_vec());
+            Ok(payload.to_vec())
+        } else {
+            Ok(decode::decode(payload)?)
         }
-        // Five bits is the shortest Huffman code. Cap the initial reservation
-        // at 64 bytes so a long, invalid payload cannot force a large allocation.
-        let mut decoded = Vec::with_capacity(payload.len().min(40) * 8 / 5);
-        for byte in payload.hpack_decode() {
-            decoded.push(byte?);
-        }
-        Ok(decoded)
     };
     if let Some(payload) = buf.chunk().get(..len) {
-        // Cursor-backed field sections otherwise allocate and copy the encoded
-        // string before decoding it. The returned value still owns its bytes.
+        // Cursor input otherwise copies the compressed string; Bytes input
+        // also avoids a temporary split/refcount update.
         let decoded = decode_payload(payload);
-        // Match copy_to_bytes: a complete payload is consumed even if its
-        // Huffman EOS or padding is invalid; a truncated payload is not.
+        // Consume a complete payload even on invalid Huffman EOS/padding,
+        // matching copy_to_bytes. Truncation is rejected before this point.
         buf.advance(len);
         decoded
     } else {
@@ -208,20 +206,6 @@ mod tests {
     }
 
     #[test]
-    fn huffman_payload_decodes_from_borrowed_bytes() {
-        // RFC 7541 Appendix C.4.1 encodes "www.example.com" as these
-        // twelve Huffman octets.
-        // https://www.rfc-editor.org/rfc/rfc7541.html#appendix-C.4.1
-        let mut encoded = Cursor::new(vec![
-            0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
-        ]);
-
-        let decoded = decode(8, &mut encoded).unwrap();
-
-        assert_eq!(decoded, b"www.example.com");
-    }
-
-    #[test]
     fn decode_preserves_payload_boundaries_across_chunks() {
         let cases = [
             (&[0x00, 0xaa][..], Ok(&b""[..])),
@@ -251,12 +235,50 @@ mod tests {
         ];
         for (encoded, expected) in cases {
             for split in 0..=encoded.len() {
-                let mut input = encoded[..split].chain(&encoded[split..]);
-                let decoded = decode(8, &mut input);
-                assert_eq!(decoded.as_deref(), expected.as_ref().copied());
-                assert_eq!(input.remaining(), 1);
-                assert_eq!(input.get_u8(), 0xaa);
+                let mut chained = encoded[..split].chain(&encoded[split..]);
+                assert_eq!(
+                    decode(8, &mut chained).as_deref(),
+                    expected.as_ref().copied()
+                );
+                assert_eq!(chained.remaining(), 1);
+                assert_eq!(chained.get_u8(), 0xaa);
+
+                let mut input = crate::buf::BufList::new();
+                for part in [&encoded[..split], &encoded[split..]] {
+                    if !part.is_empty() {
+                        input.push(bytes::Bytes::copy_from_slice(part));
+                    }
+                }
+                let mut cursor = input.cursor();
+                assert_eq!(
+                    decode(8, &mut cursor).as_deref(),
+                    expected.as_ref().copied()
+                );
+                assert_eq!(cursor.remaining(), 1);
+                assert_eq!(cursor.get_u8(), 0xaa);
             }
         }
+        // The prefix can exhaust the Cursor; a zero-length literal must not
+        // inspect another chunk merely to obtain an empty slice.
+        for prefix in [0x00, 0x80] {
+            let input = crate::buf::BufList::from(bytes::Bytes::from(vec![prefix]));
+            let mut cursor = input.cursor();
+            assert_eq!(decode(8, &mut cursor).unwrap(), b"");
+            assert_eq!(cursor.remaining(), 0);
+        }
+    }
+
+    #[test]
+    fn huffman_payload_decodes_from_borrowed_bytes() {
+        // RFC 7541 Appendix C.4.1 encodes "www.example.com" as these
+        // twelve Huffman octets.
+        // https://www.rfc-editor.org/rfc/rfc7541.html#appendix-C.4.1
+        let mut encoded = Cursor::new(vec![
+            0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+        ]);
+
+        let decoded = decode(8, &mut encoded).unwrap();
+
+        assert_eq!(decoded, b"www.example.com");
     }
 }

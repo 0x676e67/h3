@@ -1,4 +1,4 @@
-use std::{cmp, io::Cursor};
+use std::{cmp, io::Cursor, mem};
 
 use bytes::{Buf, BufMut};
 
@@ -54,9 +54,20 @@ impl std::fmt::Display for EncoderError {
     }
 }
 
+// Reuse ordinary field-section storage without pinning an unusually large
+// request's allocation for the lifetime of the connection.
+const MAX_RETAINED_BLOCK_CAPACITY: usize = 4 * 1024;
+
+/// Mutable QPACK encoder owned by one connection's shared encoder state.
+///
+/// Field sections and decoder-stream feedback use the same dynamic table.
+/// This type performs no synchronization or transport I/O; [`super::QpackEncoder`]
+/// supplies those ownership boundaries and the non-blocking-reference policy.
 pub struct Encoder {
     table: DynamicTable,
     max_table_capacity: usize,
+    // Always empty between calls. Only capacity is reused, never field bytes.
+    block_buf: Vec<u8>,
 }
 
 impl Encoder {
@@ -66,10 +77,30 @@ impl Encoder {
         total > 0 && self.table.is_known_received(total)
     }
 
+    /// Returns whether a field section could block at the peer decoder.
+    ///
+    /// `required_insert_count` is the absolute count returned by [`Self::encode`],
+    /// not its modulo-encoded wire value. A count greater than the encoder's
+    /// Known Received Count returns `true`; zero always returns `false`.
+    /// This checks current feedback without waiting or changing table state;
+    /// it does not prove that the peer is actually blocked.
+    ///
+    /// See [RFC 9204, Section 2.1.2](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2)
+    /// and [Section 2.1.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.4).
     pub(super) fn field_section_is_blocked(&self, required_insert_count: usize) -> bool {
         !self.table.is_known_received(required_insert_count)
     }
 
+    /// Appends a field section to `block` and insertions to `encoder_buf`.
+    ///
+    /// The returned Required Insert Count identifies the entries referenced by
+    /// the section. Their eviction protection is committed until peer feedback
+    /// releases it. Representations are staged because the prefix needs the
+    /// final Required Insert Count before it can precede those bytes.
+    ///
+    /// On error, temporary reference pins are released, but table mutations and
+    /// instructions already appended to `encoder_buf` are not rolled back. The
+    /// connection-level caller must discard the failed batch and close locally.
     pub fn encode<'a, W, E, T, H>(
         &mut self,
         stream_id: u64,
@@ -85,7 +116,9 @@ impl Encoder {
     {
         let max_table_capacity = self.max_table_capacity;
         let mut required_ref = 0;
-        let mut block_buf = Vec::new();
+        // Taking the empty scratch buffer also drops partial output on error;
+        // neither partial nor oversized storage is retained for the next call.
+        let mut block_buf = mem::take(&mut self.block_buf);
         let mut encoder = self.table.encoder(stream_id);
 
         for field in fields {
@@ -107,6 +140,11 @@ impl Encoder {
         block.put(block_buf.as_slice());
 
         encoder.commit(required_ref);
+
+        if block_buf.capacity() <= MAX_RETAINED_BLOCK_CAPACITY {
+            block_buf.clear();
+            self.block_buf = block_buf;
+        }
 
         Ok(required_ref)
     }
@@ -206,8 +244,7 @@ impl Encoder {
                 Some(absolute)
             }
             DynamicInsertionResult::Inserted { postbase, absolute } => {
-                InsertWithoutNameRef::new(field.name.clone(), field.value.clone())
-                    .encode(encoder)?;
+                InsertWithoutNameRef::encode_parts(&field.name, &field.value, encoder)?;
                 IndexedWithPostBase(postbase).encode(block);
                 Some(absolute)
             }
@@ -216,7 +253,7 @@ impl Encoder {
                 index,
                 absolute,
             } => {
-                InsertWithNameRef::new_static(index, field.value.clone()).encode(encoder)?;
+                InsertWithNameRef::encode_parts(index, &field.value, true, encoder)?;
                 IndexedWithPostBase(postbase).encode(block);
                 Some(absolute)
             }
@@ -225,25 +262,25 @@ impl Encoder {
                 relative,
                 absolute,
             } => {
-                InsertWithNameRef::new_dynamic(relative, field.value.clone()).encode(encoder)?;
+                InsertWithNameRef::encode_parts(relative, &field.value, false, encoder)?;
                 IndexedWithPostBase(postbase).encode(block);
                 Some(absolute)
             }
             DynamicInsertionResult::NotInserted(lookup_result) => match lookup_result {
                 DynamicLookupResult::Static(index) => {
-                    LiteralWithNameRef::new_static(index, field.value.clone()).encode(block)?;
+                    LiteralWithNameRef::encode_parts(index, &field.value, false, true, block)?;
                     None
                 }
                 DynamicLookupResult::Relative { index, absolute } => {
-                    LiteralWithNameRef::new_dynamic(index, field.value.clone()).encode(block)?;
+                    LiteralWithNameRef::encode_parts(index, &field.value, false, false, block)?;
                     Some(absolute)
                 }
                 DynamicLookupResult::PostBase { index, absolute } => {
-                    LiteralWithPostBaseNameRef::new(index, field.value.clone()).encode(block)?;
+                    LiteralWithPostBaseNameRef::encode_parts(index, &field.value, false, block)?;
                     Some(absolute)
                 }
                 DynamicLookupResult::NotFound => {
-                    Literal::new(field.name.clone(), field.value.clone()).encode(block)?;
+                    Literal::encode_parts(&field.name, &field.value, false, block)?;
                     None
                 }
             },
@@ -261,27 +298,19 @@ impl Encoder {
         // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.4
         let reference = match table.find_name(&field.name) {
             DynamicLookupResult::Static(index) => {
-                LiteralWithNameRef::new_static(index, field.value.clone())
-                    .with_never_indexed()
-                    .encode(block)?;
+                LiteralWithNameRef::encode_parts(index, &field.value, true, true, block)?;
                 None
             }
             DynamicLookupResult::Relative { index, absolute } => {
-                LiteralWithNameRef::new_dynamic(index, field.value.clone())
-                    .with_never_indexed()
-                    .encode(block)?;
+                LiteralWithNameRef::encode_parts(index, &field.value, true, false, block)?;
                 Some(absolute)
             }
             DynamicLookupResult::PostBase { index, absolute } => {
-                LiteralWithPostBaseNameRef::new(index, field.value.clone())
-                    .with_never_indexed()
-                    .encode(block)?;
+                LiteralWithPostBaseNameRef::encode_parts(index, &field.value, true, block)?;
                 Some(absolute)
             }
             DynamicLookupResult::NotFound => {
-                Literal::new(field.name.clone(), field.value.clone())
-                    .with_never_indexed()
-                    .encode(block)?;
+                Literal::encode_parts(&field.name, &field.value, true, block)?;
                 None
             }
         };
@@ -294,6 +323,7 @@ impl Default for Encoder {
         Self {
             table: DynamicTable::new(),
             max_table_capacity: 0,
+            block_buf: Vec::new(),
         }
     }
 }
@@ -356,6 +386,7 @@ impl From<DynamicTable> for Encoder {
         Encoder {
             table,
             max_table_capacity,
+            block_buf: Vec::new(),
         }
     }
 }
@@ -526,6 +557,40 @@ mod tests {
             assert_eq!(Indexed::decode(&mut b), Ok(Indexed::Static(17)));
             assert_eq!(e.get_ref().len(), 0);
         });
+    }
+
+    #[test]
+    fn encode_reuses_bounded_scratch_without_stale_fields() {
+        let mut encoder = Encoder::default();
+        for length in [64, 16, 16 * 1024, 16, 0] {
+            let field = HeaderField::new("x-scratch", vec![b'a'; length]);
+            let mut expected = vec![0xa5];
+            encode_stateless(&mut expected, [&field]).unwrap();
+            let previous_capacity = encoder.block_buf.capacity();
+            let previous_ptr = encoder.block_buf.as_ptr();
+            let mut block = vec![0xa5];
+            let mut instructions = Vec::new();
+
+            assert_eq!(
+                encoder.encode(0, &mut block, &mut instructions, [&field]),
+                Ok(0)
+            );
+            assert_eq!(block, expected);
+            assert!(instructions.is_empty());
+            assert!(encoder.block_buf.is_empty());
+            assert!(encoder.block_buf.capacity() <= MAX_RETAINED_BLOCK_CAPACITY);
+            // Exclude the caller's sentinel and the two-byte QPACK prefix.
+            let field_bytes = block.len() - 3;
+            if field_bytes > MAX_RETAINED_BLOCK_CAPACITY {
+                assert_eq!(encoder.block_buf.capacity(), 0);
+            } else {
+                assert!(encoder.block_buf.capacity() >= field_bytes);
+                if previous_capacity >= field_bytes {
+                    assert_eq!(encoder.block_buf.as_ptr(), previous_ptr);
+                    assert_eq!(encoder.block_buf.capacity(), previous_capacity);
+                }
+            }
+        }
     }
 
     #[test]

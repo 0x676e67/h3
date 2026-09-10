@@ -409,6 +409,106 @@ async fn client_error_on_bidi_recv() {
 }
 
 #[tokio::test]
+async fn client_accepts_late_control_streams_after_driver_wake() {
+    use std::{
+        sync::Arc,
+        task::{Context, Poll, Wake, Waker},
+    };
+
+    use tokio::sync::Notify;
+
+    struct DriverWake(Notify);
+
+    impl Wake for DriverWake {
+        fn wake(self: Arc<Self>) {
+            self.0.notify_one();
+        }
+    }
+
+    let mut pair = Pair::default();
+    let server = pair.server();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let (settings_tx, settings_rx) = oneshot::channel();
+
+    let client_fut = async {
+        let (mut driver, _sender) = client::builder()
+            .send_grease(false)
+            .build::<_, _, Bytes>(pair.client().await)
+            .await
+            .unwrap();
+        let wake = Arc::new(DriverWake(Notify::new()));
+        let waker = Waker::from(wake.clone());
+        assert!(
+            driver
+                .poll_close(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        ready_tx.send(()).unwrap();
+
+        // Only the registered driver waker may trigger another poll. The peer
+        // creates its first control stream after the initial accept was Pending.
+        loop {
+            wake.0.notified().await;
+            assert!(
+                driver
+                    .poll_close(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            if driver.settings().max_field_section_size == 12 {
+                break;
+            }
+        }
+        settings_tx.send(()).unwrap();
+
+        let error = loop {
+            wake.0.notified().await;
+            if let Poll::Ready(error) = driver.poll_close(&mut Context::from_waker(&waker)) {
+                break error;
+            }
+        };
+        assert_matches!(
+            error,
+            ConnectionError::Local {
+                error: LocalError::Application {
+                    code: Code::H3_STREAM_CREATION_ERROR,
+                    ..
+                }
+            }
+        );
+    };
+
+    let server_fut = async {
+        let conn = server.endpoint.accept().await.unwrap().await.unwrap();
+        ready_rx.await.unwrap();
+        let mut control = conn.open_uni().await.unwrap();
+        let mut settings = Settings::default();
+        settings
+            .insert(crate::proto::frame::SettingId::MAX_HEADER_LIST_SIZE, 12)
+            .unwrap();
+        let mut encoded = BytesMut::new();
+        StreamType::CONTROL.encode(&mut encoded);
+        Frame::<Bytes>::Settings(settings).encode(&mut encoded);
+        control.write_all(&encoded).await.unwrap();
+
+        settings_rx.await.unwrap();
+        let mut duplicate = conn.open_uni().await.unwrap();
+        encoded.clear();
+        StreamType::CONTROL.encode(&mut encoded);
+        duplicate.write_all(&encoded).await.unwrap();
+        // Keep both critical streams open: rejection must be for the duplicate,
+        // not an incidental FIN or reset.
+        // https://www.rfc-editor.org/rfc/rfc9114.html#section-6.2.1
+        conn.closed().await;
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(server_fut, client_fut);
+    })
+    .await
+    .expect("late control streams did not wake the client driver");
+}
+
+#[tokio::test]
 async fn two_control_streams() {
     init_tracing();
     let mut pair = Pair::default();

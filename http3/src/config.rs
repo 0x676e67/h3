@@ -57,16 +57,16 @@ pub struct Settings {
     /// and [Section 7.2.4.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.4.1).
     pub(crate) max_field_section_size: u64,
 
-    /// https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-3.1
+    /// <https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-3.1>
     /// Sets `SETTINGS_ENABLE_WEBTRANSPORT` if enabled
     pub(crate) enable_webtransport: bool,
-    /// https://www.rfc-editor.org/info/rfc8441 defines an extended CONNECT method in Section 4,
+    /// <https://www.rfc-editor.org/info/rfc8441> defines an extended CONNECT method in Section 4,
     /// enabled by the SETTINGS_ENABLE_CONNECT_PROTOCOL parameter.
     /// That parameter is only defined for HTTP/2.
     /// for extended CONNECT in HTTP/3; instead, the SETTINGS_ENABLE_WEBTRANSPORT setting implies
     /// that an endpoint supports extended CONNECT.
     pub(crate) enable_extended_connect: bool,
-    /// Enable HTTP Datagrams, see https://datatracker.ietf.org/doc/rfc9297/ for details
+    /// Enable HTTP Datagrams, see <https://datatracker.ietf.org/doc/rfc9297/> for details
     pub(crate) enable_datagram: bool,
     /// The maximum number of concurrent streams that can be opened by the peer.
     pub(crate) max_webtransport_sessions: u64,
@@ -236,18 +236,18 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-3.1
+    /// <https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-3.1>
     /// Sets `SETTINGS_ENABLE_WEBTRANSPORT` if enabled
     pub fn enable_webtransport(&self) -> bool {
         self.enable_webtransport
     }
 
-    /// Enable HTTP Datagrams, see https://datatracker.ietf.org/doc/rfc9297/ for details
+    /// Enable HTTP Datagrams, see <https://datatracker.ietf.org/doc/rfc9297/> for details
     pub fn enable_datagram(&self) -> bool {
         self.enable_datagram
     }
 
-    /// https://www.rfc-editor.org/info/rfc8441 defines an extended CONNECT method in Section 4,
+    /// <https://www.rfc-editor.org/info/rfc8441> defines an extended CONNECT method in Section 4,
     /// enabled by the SETTINGS_ENABLE_CONNECT_PROTOCOL parameter.
     /// That parameter is only defined for HTTP/2.
     /// for extended CONNECT in HTTP/3; instead, the SETTINGS_ENABLE_WEBTRANSPORT setting implies

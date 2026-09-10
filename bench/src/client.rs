@@ -1,9 +1,17 @@
-//! Single-threaded Rust Client execution and shared `http3`/`h3` request driver.
+//! Rust Client execution and shared `http3`/`h3` request driver.
+//!
+//! Local scheduling experiments use `HTTP3_BENCH_RUNTIME` and
+//! `HTTP3_BENCH_RUST_WORKERS`; defaults remain Tokio current-thread. Keep a
+//! separate `CRITERION_HOME` per configuration: runtime is not part of result
+//! IDs yet. These switches do not change the native nghttp3 Client.
 
 use std::{
     future::Future,
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -11,14 +19,11 @@ use anyhow::{Context, Result, bail};
 use http::Uri;
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::CertificateDer;
-use tokio::{
-    sync::{mpsc, watch},
-    task::{JoinHandle, JoinSet},
-};
+use tokio::task::{JoinHandle, JoinSet};
 
 use super::{
     case::{ALPN_H3, SERVER_ADDR, SERVER_NAME, workspace_root},
-    headers::{HeaderMode, REQUEST_HEADERS, RESPONSE_HEADERS},
+    headers::{Directions, REQUEST_HEADERS, RESPONSE_HEADERS},
     result::{ClientResult, MEASUREMENT_PROFILE, RESULT_SCHEMA},
 };
 
@@ -39,13 +44,14 @@ pub trait Adapter: Send + 'static {
 
     fn connect(
         connection: quinn::Connection,
+        qpack: Directions,
     ) -> impl Future<Output = Result<ReadyConnection<Self::Sender>>> + Send;
 
     fn send_request(
         sender: &mut Self::Sender,
         request_uri: Uri,
         expected_body_size: usize,
-        headers: HeaderMode,
+        headers: Directions,
     ) -> impl Future<Output = Result<()>> + Send;
 }
 
@@ -57,23 +63,83 @@ pub fn run_from_args<A: Adapter>(mut args: impl Iterator<Item = String>) -> Resu
     let headers = args
         .next()
         .context("missing header mode")?
-        .parse::<HeaderMode>()?;
+        .parse::<Directions>()?;
+    let qpack = args
+        .next()
+        .context("missing QPACK mode")?
+        .parse::<Directions>()?;
     if in_flight > requests {
         bail!("in-flight requests cannot exceed total requests");
     }
     if let Some(extra) = args.next() {
         bail!("unexpected internal client argument {extra:?}");
     }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("could not create current-thread client runtime")?;
-    let result = runtime.block_on(run_client::<A>(
-        requests,
-        expected_body_size,
-        in_flight,
-        headers,
-    ))?;
+    if A::HTTP3_LIBRARY == "h3" && (qpack.request || qpack.response) {
+        bail!("h3 only supports qpack=none in this benchmark");
+    }
+    // Local contention experiment: change scheduling, not the connection or
+    // SendRequest ownership. Keep initialization outside the existing timer.
+    let threads = match std::env::var("HTTP3_BENCH_RUST_WORKERS") {
+        Ok(value) => value
+            .parse::<std::num::NonZeroUsize>()
+            .context("HTTP3_BENCH_RUST_WORKERS must be a positive integer")?
+            .get(),
+        Err(std::env::VarError::NotPresent) => 1,
+        Err(error) => return Err(error).context("could not read Rust worker count"),
+    };
+    let scheduling = match std::env::var("HTTP3_BENCH_RUNTIME") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => "tokio".to_owned(),
+        Err(error) => return Err(error).context("could not read Client runtime mode"),
+    };
+    eprintln!("runtime={scheduling}; workers={threads}; connections=1; sockets=1");
+    let result = match scheduling.as_str() {
+        "tokio" => {
+            let mut builder = if threads == 1 {
+                tokio::runtime::Builder::new_current_thread()
+            } else {
+                let mut builder = tokio::runtime::Builder::new_multi_thread();
+                builder.worker_threads(threads).thread_name("http3-worker");
+                builder
+            };
+            let runtime = builder
+                .enable_all()
+                .build()
+                .context("could not create Client runtime")?;
+            runtime.block_on(run_client::<A>(
+                requests,
+                expected_body_size,
+                in_flight,
+                headers,
+                qpack,
+                Vec::new(),
+            ))
+        }
+        "no-steal-local" | "no-steal-split" => {
+            let runtime = pingora_runtime::NoStealRuntime::new(threads, "http3-no-steal");
+            let request_runtimes = if scheduling == "no-steal-split" {
+                (0..threads)
+                    .map(|index| runtime.get_runtime_at(index).clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // Initialize the pool before timing and run Endpoint/connect/driver
+            // on worker 0. Direct block_on would run the root on the caller.
+            let owner = runtime.get_runtime_at(0);
+            let result = owner.block_on(owner.spawn(run_client::<A>(
+                requests,
+                expected_body_size,
+                in_flight,
+                headers,
+                qpack,
+                request_runtimes,
+            )));
+            runtime.shutdown_timeout(Duration::from_secs(5));
+            result.context("NoSteal Client task failed")?
+        }
+        _ => bail!("unsupported Client runtime {scheduling:?}"),
+    }?;
 
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
@@ -83,7 +149,9 @@ async fn run_client<A: Adapter>(
     requests: usize,
     expected_body_size: usize,
     in_flight: usize,
-    headers: HeaderMode,
+    headers: Directions,
+    qpack: Directions,
+    request_runtimes: Vec<tokio::runtime::Handle>,
 ) -> Result<ClientResult> {
     let expected_bytes = requests
         .checked_mul(expected_body_size)
@@ -92,56 +160,49 @@ async fn run_client<A: Adapter>(
     let client_config = client_config()?;
     let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse()?)?;
     endpoint.set_default_client_config(client_config);
-    let connection = connect::<A>(&endpoint).await?;
-    let driver = connection.driver;
-    let quic_connection = connection.quic_connection;
-    let sender_guard = connection.sender;
+    let server_addr: SocketAddr = SERVER_ADDR.parse()?;
+    let collect_stats = std::env::var_os("HTTP3_BENCH_QUINN_STATS").is_some();
+    // Reusable setup (runtime, trust store, TLS configuration and UDP endpoint)
+    // is excluded. Include this connection's TLS/QUIC handshake and HTTP/3 setup,
+    // batch bookkeeping, requests and joining the completed request workers.
+    let benchmark_started = Instant::now();
+    let ReadyConnection {
+        sender: sender_guard,
+        driver,
+        quic_connection,
+    } = connect::<A>(&endpoint, server_addr, qpack).await?;
+    // Optional profiling captures request counters before spawning workers.
+    // Its snapshot is inside the timer, so profiling timings are diagnostic only.
+    let stats_before = collect_stats.then(|| quic_connection.stats());
     let worker_count = requests.min(in_flight);
-    let requests_per_worker = requests / worker_count;
-    let workers_with_extra_request = requests % worker_count;
-    let (prepared_tx, mut prepared_rx) = mpsc::channel(worker_count);
-    let (start_tx, start_rx) = watch::channel(false);
+    // Each worker starts one request, then takes shared slots to keep the window
+    // full like the native Client, even when one worker is slower than the rest.
+    let remaining_requests = Arc::new(AtomicUsize::new(requests - worker_count));
     let mut workers = JoinSet::new();
-    for worker_index in 0..worker_count {
-        let assigned_requests =
-            requests_per_worker + usize::from(worker_index < workers_with_extra_request);
-        workers.spawn(run_request_worker::<A>(
+    for index in 0..worker_count {
+        let request_worker = run_request_worker::<A>(
             sender_guard.clone(),
-            assigned_requests,
+            remaining_requests.clone(),
             expected_body_size,
             headers,
-            prepared_tx.clone(),
-            start_rx.clone(),
-        ));
+        );
+        if request_runtimes.is_empty() {
+            workers.spawn(request_worker);
+        } else {
+            // Assign a long-lived worker once, not each individual request.
+            // Fixed placement removes stealing but not shared-connection locks.
+            workers.spawn_on(
+                request_worker,
+                &request_runtimes[index % request_runtimes.len()],
+            );
+        }
     }
-    drop(prepared_tx);
-    drop(start_rx);
-    for _ in 0..worker_count {
-        prepared_rx
-            .recv()
-            .await
-            .context("request workers exited before reaching the start barrier")?;
-    }
-    // Profiling snapshots stay outside the request timer and are opt-in.
-    let stats_before = std::env::var_os("HTTP3_BENCH_QUINN_STATS").map(|_| quic_connection.stats());
-    let benchmark_started = Instant::now();
-    start_tx
-        .send(true)
-        .context("request workers exited before the benchmark started")?;
-
-    let mut finished_at = None;
     while let Some(result) = workers.join_next().await {
-        let worker_finished_at = result.context("request worker failed")??;
-        // Workers overlap, so the batch ends at the latest completion. Summing
-        // their durations would double-count parallel request work.
-        finished_at = Some(finished_at.map_or(worker_finished_at, |current: Instant| {
-            current.max(worker_finished_at)
-        }));
+        result.context("request worker failed")??;
     }
-    let finished_at = finished_at.context("connection did not run any request workers")?;
-    let elapsed = finished_at
-        .checked_duration_since(benchmark_started)
-        .context("benchmark finish timestamp preceded its start")?;
+    // Measure the whole batch at the caller, including normal task completion.
+    // Final statistics, connection shutdown and result formatting stay out.
+    let elapsed = benchmark_started.elapsed();
     let stats_after = quic_connection.stats();
     let path_max_udp_payload_size = usize::from(stats_after.path.current_mtu);
     if let Some(stats_before) = stats_before {
@@ -158,6 +219,7 @@ async fn run_client<A: Adapter>(
     Ok(ClientResult {
         schema: RESULT_SCHEMA.to_owned(),
         http3_library: A::HTTP3_LIBRARY.to_owned(),
+        qpack: qpack.to_string(),
         quic_backend: "quinn".to_owned(),
         transport_profile: "quinn-default-pmtud".to_owned(),
         measurement_profile: MEASUREMENT_PROFILE.to_owned(),
@@ -190,6 +252,9 @@ fn client_config() -> Result<quinn::ClientConfig> {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
     provider.cipher_suites =
         vec![rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256];
+    // Handshakes are timed: match the native peers instead of inheriting a
+    // different classical/post-quantum preference from each TLS provider.
+    provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519];
     let mut tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_root_certificates(roots)
@@ -201,8 +266,11 @@ fn client_config() -> Result<quinn::ClientConfig> {
     )))
 }
 
-async fn connect<A: Adapter>(endpoint: &quinn::Endpoint) -> Result<ReadyConnection<A::Sender>> {
-    let server_addr: SocketAddr = SERVER_ADDR.parse()?;
+async fn connect<A: Adapter>(
+    endpoint: &quinn::Endpoint,
+    server_addr: SocketAddr,
+    qpack: Directions,
+) -> Result<ReadyConnection<A::Sender>> {
     let connection = endpoint.connect(server_addr, SERVER_NAME)?.await?;
     let handshake = connection
         .handshake_data()
@@ -212,30 +280,17 @@ async fn connect<A: Adapter>(endpoint: &quinn::Endpoint) -> Result<ReadyConnecti
     if handshake.protocol.as_deref() != Some(ALPN_H3) {
         bail!("TLS did not negotiate h3: {:?}", handshake.protocol);
     }
-    A::connect(connection).await
+    A::connect(connection, qpack).await
 }
 
 async fn run_request_worker<A: Adapter>(
     mut sender: A::Sender,
-    assigned_requests: usize,
+    remaining_requests: Arc<AtomicUsize>,
     expected_body_size: usize,
-    headers: HeaderMode,
-    prepared: mpsc::Sender<()>,
-    mut start: watch::Receiver<bool>,
-) -> Result<Instant> {
+    headers: Directions,
+) -> Result<()> {
     let request_uri = Uri::from_static(REQUEST_URI);
-    prepared
-        .send(())
-        .await
-        .context("benchmark controller exited before request worker was prepared")?;
-    drop(prepared);
-    if !*start.borrow_and_update() {
-        start
-            .changed()
-            .await
-            .context("benchmark start barrier closed before release")?;
-    }
-    for _ in 0..assigned_requests {
+    loop {
         A::send_request(
             &mut sender,
             request_uri.clone(),
@@ -243,11 +298,18 @@ async fn run_request_worker<A: Adapter>(
             headers,
         )
         .await?;
+        // This counter hands out request slots, not data from another worker.
+        // A failed decrement leaves zero intact, even when every worker exits.
+        if remaining_requests
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_err()
+        {
+            break;
+        }
     }
-    // This timestamp defines the throughput denominator. Taking it after
-    // JoinSet aggregation would charge Rust-only scheduler unwinding and make
-    // the cross-stack comparison unfair.
-    Ok(Instant::now())
+    Ok(())
 }
 
 fn parse_positive(args: &mut impl Iterator<Item = String>, name: &str) -> Result<usize> {
@@ -275,6 +337,23 @@ fn duration_ns(duration: Duration) -> Result<u64> {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! client_adapter {
+    (@configure http3, $builder:ident, $qpack:ident) => {
+        if $qpack.request {
+            $builder.qpack_encoder_table_capacity($crate::case::QPACK_TABLE_CAPACITY);
+        }
+        if $qpack.response {
+            $builder
+                .qpack_max_table_capacity(u64::try_from($crate::case::QPACK_TABLE_CAPACITY)?)
+                .qpack_blocked_streams($crate::case::QPACK_BLOCKED_STREAMS);
+        }
+    };
+    (@configure h3, $builder:ident, $qpack:ident) => {
+        // The fixed upstream revision only wires stateless QPACK into its Client.
+        // Running a dynamic case anyway would silently measure a different mode.
+        if $qpack.request || $qpack.response {
+            anyhow::bail!("h3 only supports qpack=none in this benchmark");
+        }
+    };
     ($adapter:ident, $http3_crate:ident, $transport:ident, $library:literal) => {
         struct $adapter;
 
@@ -285,10 +364,12 @@ macro_rules! client_adapter {
 
             async fn connect(
                 connection: quinn::Connection,
+                qpack: $crate::headers::Directions,
             ) -> anyhow::Result<$crate::client::ReadyConnection<Self::Sender>> {
                 let quic_connection = connection.clone();
                 let mut builder = $http3_crate::client::builder();
                 builder.send_grease(false);
+                $crate::client_adapter!(@configure $http3_crate, builder, qpack);
                 let (mut connection, sender) = builder
                     .build($transport::Connection::new(connection))
                     .await?;
@@ -311,7 +392,7 @@ macro_rules! client_adapter {
                 sender: &mut Self::Sender,
                 request_uri: http::Uri,
                 expected_body_size: usize,
-                headers: $crate::headers::HeaderMode,
+                headers: $crate::headers::Directions,
             ) -> anyhow::Result<()> {
                 use anyhow::Context as _;
                 use bytes::Buf as _;
@@ -341,12 +422,17 @@ macro_rules! client_adapter {
                     headers.response,
                 )
                 .context("invalid benchmark response headers")?;
-                let declared_body_size = response
+                let mut content_lengths = response
                     .headers()
-                    .get(http::header::CONTENT_LENGTH)
-                    .context("response omitted content-length")?
-                    .to_str()?
-                    .parse::<usize>()?;
+                    .get_all(http::header::CONTENT_LENGTH)
+                    .iter();
+                let content_length = content_lengths
+                    .next()
+                    .context("response omitted content-length")?;
+                if content_lengths.next().is_some() {
+                    anyhow::bail!("response contained duplicate content-length fields");
+                }
+                let declared_body_size = content_length.to_str()?.parse::<usize>()?;
                 if declared_body_size != expected_body_size {
                     anyhow::bail!(
                         "expected content-length {expected_body_size}, got {declared_body_size}"

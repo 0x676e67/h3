@@ -112,7 +112,7 @@ async fn client_dynamic_qpack_request_round_trip() {
                 panic!("connection closed before QPACK encoder became ready: {error:?}");
             }
             encoder
-                .dynamic_ready()
+                .ready()
                 .unwrap()
                 .then_some(())
                 .map_or(std::task::Poll::Pending, std::task::Poll::Ready)
