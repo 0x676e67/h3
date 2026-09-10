@@ -651,8 +651,6 @@ impl Pseudo {
 
 #[derive(Debug)]
 pub enum HeaderError {
-    /// The decoded field section exceeds the local HeaderMap capacity.
-    TooManyFields,
     InvalidHeaderName(String),
     InvalidHeaderValue(String),
     InvalidRequest(http::Error),
@@ -660,6 +658,8 @@ pub enum HeaderError {
     MissingStatus,
     MissingAuthority,
     ContradictedAuthority,
+    /// The decoded field section exceeds the local HeaderMap capacity.
+    TooManyFields,
 }
 
 impl HeaderError {
@@ -701,7 +701,6 @@ impl std::error::Error for HeaderError {}
 impl fmt::Display for HeaderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            HeaderError::TooManyFields => write!(f, "field section exceeds local header capacity"),
             HeaderError::InvalidHeaderName(h) => write!(f, "invalid header name: {}", h),
             HeaderError::InvalidHeaderValue(v) => write!(f, "invalid header value: {}", v),
             HeaderError::InvalidRequest(r) => write!(f, "invalid request: {}", r),
@@ -711,6 +710,7 @@ impl fmt::Display for HeaderError {
             HeaderError::ContradictedAuthority => {
                 write!(f, "uri and authority field are in contradiction")
             }
+            HeaderError::TooManyFields => write!(f, "field section exceeds local header capacity"),
         }
     }
 }
