@@ -1875,6 +1875,7 @@ where
 
         Poll::Ready(Ok(Some(
             Header::try_from(fields)
+                .and_then(Header::into_trailers)
                 .map_err(|error| {
                     let code = error.code();
                     self.stop_sending(code);
@@ -1882,8 +1883,7 @@ where
                         code,
                         reason: format!("rejected trailers: {error}"),
                     }
-                })?
-                .into_fields(),
+                })?,
         )))
     }
 

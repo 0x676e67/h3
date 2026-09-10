@@ -202,6 +202,9 @@ impl Header {
         }
     }
 
+    /// Extracts request parts, rejecting response pseudo-fields and invalid
+    /// request components. Protocol negotiation remains the caller's concern.
+    /// See [RFC 9114 Section 4.3](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.3).
     pub fn into_request_parts(
         self,
     ) -> Result<
@@ -214,6 +217,9 @@ impl Header {
         ),
         HeaderError,
     > {
+        if self.pseudo.status.is_some() {
+            return Err(HeaderError::UnexpectedPseudo);
+        }
         let mut uri = Uri::builder();
 
         if let Some(path) = self.pseudo.path {
@@ -262,9 +268,19 @@ impl Header {
         ))
     }
 
+    /// Extracts response parts, requiring a status and rejecting request pseudo-fields.
+    /// See [RFC 9114 Section 4.3](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.3).
     pub fn into_response_parts(
         self,
     ) -> Result<(StatusCode, HeaderMap, PseudoHeaderSensitivity), HeaderError> {
+        if self.pseudo.method.is_some()
+            || self.pseudo.scheme.is_some()
+            || self.pseudo.authority.is_some()
+            || self.pseudo.path.is_some()
+            || self.pseudo.protocol.is_some()
+        {
+            return Err(HeaderError::UnexpectedPseudo);
+        }
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.2
         //= type=implication
         //# For responses, a single ":status" pseudo-header field is defined that
@@ -280,8 +296,15 @@ impl Header {
         ))
     }
 
-    pub fn into_fields(self) -> HeaderMap {
-        self.fields
+    /// Extracts trailers, rejecting every pseudo-header field.
+    ///
+    /// Unlike initial request/response headers, trailers have no message-control
+    /// fields. See [RFC 9114 Section 4.3](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.3).
+    pub fn into_trailers(self) -> Result<HeaderMap, HeaderError> {
+        if self.pseudo.len != 0 {
+            return Err(HeaderError::UnexpectedPseudo);
+        }
+        Ok(self.fields)
     }
 
     pub fn len(&self) -> usize {
@@ -359,11 +382,25 @@ impl TryFrom<Vec<HeaderField<'static>>> for Header {
         let mut fields =
             HeaderMap::try_with_capacity(headers.len()).map_err(|_| HeaderError::TooManyFields)?;
         let mut pseudo = Pseudo::default();
+        let mut seen = 0_u8;
 
         for field in headers.into_iter() {
             let sensitive = field.is_sensitive();
             let (name, value) = field.into_inner();
-            match Field::parse(name, value)? {
+            let field = Field::parse(name, value)?;
+            if let Some(id) = field.pseudo_id() {
+                // A HeaderMap cannot retain wire order or duplicate pseudo
+                // fields. Validate before inserting either kind of field.
+                // https://www.rfc-editor.org/rfc/rfc9114.html#section-4.3
+                if !fields.is_empty() {
+                    return Err(HeaderError::PseudoAfterField);
+                }
+                if seen & id.mask_id() != 0 {
+                    return Err(HeaderError::DuplicatePseudo);
+                }
+                seen |= id.mask_id();
+            }
+            match field {
                 Field::Method(m) => {
                     pseudo.method = Some(m);
                     pseudo.len += 1;
@@ -418,6 +455,19 @@ enum Field {
 }
 
 impl Field {
+    /// Identifies message-control fields before their wire order is lost.
+    fn pseudo_id(&self) -> Option<PseudoId> {
+        match self {
+            Self::Method(_) => Some(PseudoId::Method),
+            Self::Scheme(_) => Some(PseudoId::Scheme),
+            Self::Authority(_) => Some(PseudoId::Authority),
+            Self::Path(_) => Some(PseudoId::Path),
+            Self::Status(_) => Some(PseudoId::Status),
+            Self::Protocol(_) => Some(PseudoId::Protocol),
+            Self::Header(_) => None,
+        }
+    }
+
     fn parse(name: Cow<'static, [u8]>, value: Cow<'static, [u8]>) -> Result<Self, HeaderError> {
         let name = name.as_ref();
         if name.is_empty() {
@@ -659,6 +709,9 @@ pub enum HeaderError {
     MissingAuthority,
     ContradictedAuthority,
     TooManyFields,
+    UnexpectedPseudo,
+    DuplicatePseudo,
+    PseudoAfterField,
 }
 
 impl HeaderError {
@@ -710,6 +763,9 @@ impl fmt::Display for HeaderError {
                 write!(f, "uri and authority field are in contradiction")
             }
             HeaderError::TooManyFields => write!(f, "field section exceeds local header capacity"),
+            HeaderError::UnexpectedPseudo => write!(f, "pseudo-header is invalid in this context"),
+            HeaderError::DuplicatePseudo => write!(f, "duplicate pseudo-header"),
+            HeaderError::PseudoAfterField => write!(f, "pseudo-header follows a regular field"),
         }
     }
 }
@@ -719,6 +775,113 @@ mod tests {
     use assert_matches::assert_matches;
 
     use super::*;
+
+    #[test]
+    fn received_pseudo_fields_reject_duplicates_and_late_placement() {
+        for (name, value) in [
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":authority", "localhost"),
+            (":path", "/"),
+            (":status", "200"),
+            (":protocol", "webtransport"),
+        ] {
+            let field = HeaderField::new(name, value);
+            assert_matches!(
+                Header::try_from(vec![field.clone(), field.clone()]),
+                Err(HeaderError::DuplicatePseudo)
+            );
+            assert_matches!(
+                Header::try_from(vec![HeaderField::new("x-regular", "v"), field]),
+                Err(HeaderError::PseudoAfterField)
+            );
+        }
+    }
+
+    #[test]
+    fn received_pseudo_fields_require_their_message_context() {
+        for (name, value) in [
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":authority", "localhost"),
+            (":path", "/"),
+            (":protocol", "webtransport"),
+        ] {
+            let field = HeaderField::new(name, value);
+            assert_matches!(
+                Header::try_from(vec![HeaderField::new(":status", "200"), field.clone()])
+                    .unwrap()
+                    .into_response_parts(),
+                Err(HeaderError::UnexpectedPseudo)
+            );
+            assert_matches!(
+                Header::try_from(vec![field]).unwrap().into_trailers(),
+                Err(HeaderError::UnexpectedPseudo)
+            );
+        }
+        let status = HeaderField::new(":status", "200");
+        assert_matches!(
+            Header::try_from(vec![status.clone()])
+                .unwrap()
+                .into_request_parts(),
+            Err(HeaderError::UnexpectedPseudo)
+        );
+        assert_matches!(
+            Header::try_from(vec![status]).unwrap().into_trailers(),
+            Err(HeaderError::UnexpectedPseudo)
+        );
+    }
+
+    #[test]
+    fn valid_received_trailers_preserve_duplicate_sensitive_fields() {
+        let mut field = HeaderField::new("x-trailer", "value");
+        field.sensitive = true;
+        let trailers = Header::try_from(vec![field; 2])
+            .unwrap()
+            .into_trailers()
+            .unwrap();
+        assert_eq!(trailers.len(), 2);
+        assert!(
+            trailers
+                .get_all("x-trailer")
+                .iter()
+                .all(HeaderValue::is_sensitive)
+        );
+        assert!(
+            Header::try_from(Vec::new())
+                .unwrap()
+                .into_trailers()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn received_connect_context_preserves_standard_and_extended_forms() {
+        for extended in [false, true] {
+            let mut fields = vec![
+                HeaderField::new(":method", "CONNECT"),
+                HeaderField::new(":authority", "localhost:443"),
+            ];
+            if extended {
+                fields.extend([
+                    HeaderField::new(":scheme", "https"),
+                    HeaderField::new(":path", "/session"),
+                    HeaderField::new(":protocol", "webtransport"),
+                ]);
+            }
+            let (method, uri, protocol, _, _) = Header::try_from(fields)
+                .unwrap()
+                .into_request_parts()
+                .unwrap();
+            assert_eq!(method, Method::CONNECT);
+            assert_eq!(uri.authority().unwrap().as_str(), "localhost:443");
+            assert_eq!(
+                protocol.as_ref().map(Protocol::as_str),
+                extended.then_some("webtransport")
+            );
+        }
+    }
 
     #[test]
     fn oversized_decoded_field_count_is_a_resource_error() {
