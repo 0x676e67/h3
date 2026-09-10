@@ -234,13 +234,13 @@ where
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
                 //# Malformed requests or responses that are
                 //# detected MUST be treated as a stream error of type H3_MESSAGE_ERROR.
-                let error_code = Code::H3_MESSAGE_ERROR;
+                let error_code = err.code();
                 self.request_stream.stop_stream(error_code);
                 self.request_stream.stop_sending(error_code);
 
                 return Err(StreamError::StreamError {
                     code: error_code,
-                    reason: format!("Malformed request with error: {}", err),
+                    reason: format!("rejected request headers: {err}"),
                 });
             }
         };

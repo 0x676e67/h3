@@ -171,19 +171,13 @@ where
         let qpack::Decoded { fields, .. } = decoded;
 
         let (status, headers, pseudo_sensitivity) = Header::try_from(fields)
-            .map_err(|_e| {
-                self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
+            .and_then(Header::into_response_parts)
+            .map_err(|error| {
+                let code = error.code();
+                self.inner.stop_sending(code);
                 StreamError::StreamError {
-                    code: Code::H3_MESSAGE_ERROR,
-                    reason: "Received malformed header".to_string(),
-                }
-            })?
-            .into_response_parts()
-            .map_err(|_e| {
-                self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
-                StreamError::StreamError {
-                    code: Code::H3_MESSAGE_ERROR,
-                    reason: "Received malformed header".to_string(),
+                    code,
+                    reason: format!("rejected response headers: {error}"),
                 }
             })?;
 
