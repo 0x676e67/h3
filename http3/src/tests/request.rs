@@ -174,6 +174,18 @@ async fn rejected_request_fields(
 }
 
 #[tokio::test]
+async fn invalid_pseudo_fields_reject_only_the_affected_stream() {
+    for trailers in [false, true] {
+        let fields = vec![
+            qpack::HeaderField::new(":status", "200"),
+            qpack::HeaderField::new(":method", "GET"),
+        ];
+        rejected_response_fields(fields.clone(), trailers, Code::H3_MESSAGE_ERROR).await;
+        rejected_request_fields(fields, trailers, Code::H3_MESSAGE_ERROR).await;
+    }
+}
+
+#[tokio::test]
 async fn excessive_field_count_rejects_only_the_affected_stream() {
     for trailers in [false, true] {
         let fields = vec![qpack::HeaderField::new("accept", "*/*"); 40_000];
