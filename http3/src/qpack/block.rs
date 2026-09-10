@@ -477,9 +477,17 @@ impl LiteralWithPostBaseNameRef {
     }
 
     pub fn encode<W: BufMut>(&self, buf: &mut W) -> Result<(), prefix_string::Error> {
-        prefix_int::encode(3, u8::from(self.never_indexed), self.index as u64, buf);
-        prefix_string::encode(8, 0, &self.value, buf)?;
-        Ok(())
+        Self::encode_parts(self.index, &self.value, self.never_indexed, buf)
+    }
+
+    pub fn encode_parts<W: BufMut>(
+        index: usize,
+        value: &[u8],
+        never_indexed: bool,
+        buf: &mut W,
+    ) -> Result<(), prefix_string::Error> {
+        prefix_int::encode(3, u8::from(never_indexed), index as u64, buf);
+        prefix_string::encode(8, 0, value, buf)
     }
 }
 

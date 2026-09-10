@@ -1,4 +1,4 @@
-//! Fixed browser-shaped fields and directional QPACK workload selection.
+//! Fixed browser-shaped fields and request/response direction selection.
 
 use std::{fmt, str::FromStr};
 
@@ -8,13 +8,36 @@ use http::{HeaderMap, HeaderName, HeaderValue};
 // Rust and C share the browser/application request and designed response fixtures.
 include!(concat!(env!("OUT_DIR"), "/headers.rs"));
 
-#[derive(Clone, Copy, Debug)]
-pub struct HeaderMode {
+/// Selects the request and response directions independently, for either
+/// additional fields or dynamic QPACK. These are separate benchmark controls.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Directions {
     pub request: bool,
     pub response: bool,
 }
 
-impl FromStr for HeaderMode {
+impl Directions {
+    pub const ALL: [Self; 4] = [
+        Self {
+            request: false,
+            response: false,
+        },
+        Self {
+            request: true,
+            response: false,
+        },
+        Self {
+            request: false,
+            response: true,
+        },
+        Self {
+            request: true,
+            response: true,
+        },
+    ];
+}
+
+impl FromStr for Directions {
     type Err = anyhow::Error;
 
     fn from_str(value: &str) -> Result<Self> {
@@ -23,15 +46,15 @@ impl FromStr for HeaderMode {
             "request" => (true, false),
             "response" => (false, true),
             "both" => (true, true),
-            _ => bail!(
-                "unsupported header mode {value:?}; expected none, request, response, or both"
-            ),
+            _ => {
+                bail!("unsupported direction {value:?}; expected none, request, response, or both")
+            }
         };
         Ok(Self { request, response })
     }
 }
 
-impl fmt::Display for HeaderMode {
+impl fmt::Display for Directions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match (self.request, self.response) {
             (false, false) => "none",

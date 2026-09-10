@@ -10,11 +10,10 @@ use bytes::{Buf, BufMut};
 #[cfg(test)]
 pub use self::bitwin::BitWindow;
 #[cfg(test)]
+pub use self::decode::HpackStringDecode;
+#[cfg(test)]
 pub use self::encode::HpackStringEncode;
-pub use self::{
-    decode::{Error as HuffmanDecodingError, HpackStringDecode},
-    encode::Error as HuffmanEncodingError,
-};
+pub use self::{decode::Error as HuffmanDecodingError, encode::Error as HuffmanEncodingError};
 use crate::qpack::prefix_int::{self, Error as IntegerError};
 
 #[derive(Debug, PartialEq)]
@@ -64,17 +63,28 @@ pub(crate) fn decode_limited<B: Buf>(
         return Err(Error::UnexpectedEnd);
     }
 
-    let payload = buf.copy_to_bytes(len);
-    let value = if flags & 1 == 0 {
-        payload.into_iter().collect()
-    } else {
-        let mut decoded = Vec::new();
-        for byte in payload.as_ref().hpack_decode() {
-            decoded.push(byte?);
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+
+    let decode_payload = |payload: &[u8]| -> Result<Vec<u8>, Error> {
+        if flags & 1 == 0 {
+            Ok(payload.to_vec())
+        } else {
+            Ok(decode::decode(payload)?)
         }
-        decoded
     };
-    Ok(value)
+    if let Some(payload) = buf.chunk().get(..len) {
+        // Cursor input otherwise copies the compressed string; Bytes input
+        // also avoids a temporary split/refcount update.
+        let decoded = decode_payload(payload);
+        // Consume a complete payload even on invalid Huffman EOS/padding,
+        // matching copy_to_bytes. Truncation is rejected before this point.
+        buf.advance(len);
+        decoded
+    } else {
+        decode_payload(&buf.copy_to_bytes(len))
+    }
 }
 
 pub fn encode<B: BufMut>(size: u8, flags: u8, value: &[u8], buf: &mut B) -> Result<(), Error> {
@@ -193,6 +203,61 @@ mod tests {
         );
         assert_eq!(usize::try_from(read.position()).unwrap(), prefix_len);
         assert_eq!(read.remaining(), 0);
+    }
+
+    #[test]
+    fn decode_preserves_payload_boundaries_across_chunks() {
+        let cases = [
+            (&[0x00, 0xaa][..], Ok(&b""[..])),
+            (&[0x03, b'f', b'o', b'o', 0xaa], Ok(b"foo")),
+            (&[0x81, 0x1f, 0xaa], Ok(b"a")),
+            (
+                &[
+                    0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+                    0xaa,
+                ],
+                Ok(b"www.example.com"),
+            ),
+            (
+                &[0x81, 0xff, 0xaa],
+                Err(Error::HuffmanDecoding(
+                    HuffmanDecodingError::InvalidPadding(8),
+                )),
+            ),
+            (
+                &[0x84, 0xff, 0xff, 0xff, 0xff, 0xaa],
+                Err(Error::HuffmanDecoding(HuffmanDecodingError::Eos)),
+            ),
+            (
+                &[0x85, 0x1f, 0xff, 0xff, 0xff, 0xff, 0xaa],
+                Err(Error::HuffmanDecoding(HuffmanDecodingError::Eos)),
+            ),
+        ];
+        for (encoded, expected) in cases {
+            for split in 0..=encoded.len() {
+                let mut input = crate::buf::BufList::new();
+                for part in [&encoded[..split], &encoded[split..]] {
+                    if !part.is_empty() {
+                        input.push(bytes::Bytes::copy_from_slice(part));
+                    }
+                }
+                let mut cursor = input.cursor();
+                assert_eq!(
+                    decode(8, &mut cursor).as_deref(),
+                    expected.as_ref().copied()
+                );
+                assert_eq!(cursor.remaining(), 1);
+                assert_eq!(cursor.get_u8(), 0xaa);
+            }
+        }
+        // The prefix can exhaust the Cursor; a zero-length literal must not
+        // inspect another chunk merely to obtain an empty slice.
+        for prefix in [0x00, 0x80] {
+            let input = crate::buf::BufList::from(bytes::Bytes::from(vec![prefix]));
+            let mut cursor = input.cursor();
+            assert_eq!(decode(8, &mut cursor).unwrap(), b"");
+            assert_eq!(cursor.remaining(), 0);
+        }
     }
 
     #[test]

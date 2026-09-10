@@ -1,10 +1,10 @@
 use std::{
     collections::BTreeMap,
-    sync::{Arc, RwLock, RwLockReadGuard, TryLockError},
+    sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, TryLockError},
     task::{Context, Poll, Waker},
 };
 
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_util::task::AtomicWaker;
 use tokio::sync::mpsc;
 
@@ -44,6 +44,243 @@ mod tests;
 pub enum Error {
     Encoder(EncoderError),
     Decoder(DecoderError),
+}
+
+/// Encoder state and its instruction-queue tail, mutated under one lock.
+///
+/// Table insertions and their wire instructions must become visible together:
+/// feedback must never observe an insertion from a partially encoded batch.
+#[derive(Default)]
+struct QpackEncoderState {
+    encoder: Encoder,
+    // Committed QPACK encoder-stream output. Encoding starts only while this
+    // queue is empty; a successful encode never retracts its instructions.
+    // This is the local outq boundary for the Insert Count Increment check.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.3
+    pending: BytesMut,
+    enabled: bool,
+}
+
+/// Shared QPACK state for encoding a connection's initial request HEADERS.
+///
+/// Request tasks encode field sections; the connection driver applies peer
+/// decoder-stream feedback and drains local encoder-stream instructions. Clones
+/// share the same table, reference tracking and instruction queue. The default
+/// Client path calls [`encode_stateless`] directly, without taking this lock.
+///
+/// Dynamic encoding is opt-in and starts after [`Self::configure`] applies the
+/// peer's SETTINGS. Inserts may prewarm the table, but transmitted field sections
+/// reference only entries covered by the Known Received Count. Otherwise the
+/// field section falls back to stateless encoding without retracting inserts.
+/// Thus this policy does not consume the peer's blocked-stream allowance.
+///
+/// Unlike [`QpackDecoder`], encoding mutates reference tracking even on table
+/// hits. These updates, feedback and queued instructions require exclusive
+/// access. Each method acquires a synchronous mutex and may wait for another
+/// caller; none retains a guard across an await, transport poll or driver wakeup.
+/// Callers perform I/O and wake the driver only after the method returns.
+///
+/// See [RFC 9204, Sections 2.1.2 and 2.1.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-2.1.2).
+#[derive(Clone, Default)]
+pub(crate) struct QpackEncoder {
+    state: Arc<Mutex<QpackEncoderState>>,
+}
+
+#[derive(Debug)]
+pub(crate) enum QpackEncoderError {
+    Encoder(EncoderError),
+    Poisoned,
+}
+
+impl std::fmt::Display for QpackEncoderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Encoder(error) => error.fmt(formatter),
+            Self::Poisoned => formatter.write_str("QPACK encoder state is poisoned"),
+        }
+    }
+}
+
+impl From<EncoderError> for QpackEncoderError {
+    fn from(error: EncoderError) -> Self {
+        Self::Encoder(error)
+    }
+}
+
+impl QpackEncoder {
+    fn lock(&self) -> Result<MutexGuard<'_, QpackEncoderState>, QpackEncoderError> {
+        self.state.lock().map_err(|_| QpackEncoderError::Poisoned)
+    }
+
+    /// Checks whether dynamic encoding is enabled and the shared queue is empty.
+    ///
+    /// This is a snapshot, not a reservation: another request can queue output
+    /// before [`Self::encode`] runs, so that method checks the state again. An
+    /// earlier batch may still be held by the driver or transport.
+    ///
+    /// Returns an error if the encoder mutex is poisoned.
+    pub(crate) fn ready(&self) -> Result<bool, QpackEncoderError> {
+        let state = self.lock()?;
+        Ok(state.enabled && state.pending.is_empty())
+    }
+
+    /// Initializes dynamic encoding after the first peer SETTINGS is accepted.
+    ///
+    /// `max_table_capacity` is the peer's advertised maximum, used for Required
+    /// Insert Count wrapping; `capacity` is the locally chosen value within that
+    /// maximum. A zero capacity is a no-op, not a runtime disable operation.
+    /// The driver takes the queued capacity instruction before insertions can
+    /// be generated; later batches must follow it on the encoder stream. This
+    /// method does not send bytes or wake the driver.
+    ///
+    /// Returns an error for invalid capacity settings or a poisoned mutex; the
+    /// caller must terminate the connection rather than retry initialization.
+    ///
+    /// See [RFC 9204, Sections 3.2.3](https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2.3)
+    /// and [4.5.1.1](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.5.1.1).
+    pub(crate) fn configure(
+        &self,
+        max_table_capacity: usize,
+        capacity: usize,
+    ) -> Result<(), QpackEncoderError> {
+        if capacity == 0 {
+            return Ok(());
+        }
+
+        let mut state = self.lock()?;
+        let QpackEncoderState {
+            encoder,
+            pending,
+            enabled,
+        } = &mut *state;
+        // Generate speculative insertions with one private slot, but transmit
+        // only field sections whose Required Insert Count is already known by
+        // the peer. The peer's blocked-stream allowance is therefore never
+        // consumed, including when it is zero.
+        encoder.configure(pending, max_table_capacity, capacity, 1)?;
+        *enabled = true;
+        Ok(())
+    }
+
+    /// Appends an initial request field section and commits encoder instructions.
+    ///
+    /// `stream_id` must identify a new request stream with no earlier encoded
+    /// field sections. The caller checks the peer's field-section size limit
+    /// before calling; cloned `fields` must yield the same fields for fallback.
+    /// This API is not a trailers encoder: fallback cancels tracking for the
+    /// entire stream before replacing the speculative section with stateless
+    /// output. Insertions remain queued to prewarm the peer's dynamic table.
+    ///
+    /// Returns `true` when instructions were queued and the caller should wake
+    /// the driver. `false` does not imply stateless output: an acknowledged table
+    /// hit can produce a dynamic section without new instructions. Once this
+    /// method succeeds, a canceled HEADERS write must not roll back references;
+    /// the peer may already have received bytes and can still acknowledge them.
+    ///
+    /// On encoding or lock failure, discard the field-section output and close
+    /// the connection with a local error. Table mutations are not transactional;
+    /// this state must not be reused after an error.
+    pub(crate) fn encode<'a, T, H>(
+        &self,
+        stream_id: StreamId,
+        block: &mut BytesMut,
+        fields: T,
+    ) -> Result<bool, QpackEncoderError>
+    where
+        T: IntoIterator<Item = H> + Clone,
+        H: AsRef<HeaderField<'a>>,
+    {
+        let mut state = self.lock()?;
+        if !state.enabled || !state.pending.is_empty() {
+            drop(state);
+            encode_stateless(block, fields)?;
+            return Ok(false);
+        }
+
+        let QpackEncoderState {
+            encoder,
+            pending,
+            enabled,
+        } = &mut *state;
+        let block_start = block.len();
+        let required_insert_count =
+            match encoder.encode(stream_id.into_inner(), block, pending, fields.clone()) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    // Encoding can mutate the local table before a later string
+                    // conversion fails. Discard the uncommitted instruction
+                    // batch; the caller must terminate the connection because
+                    // this encoder state is no longer reusable.
+                    pending.clear();
+                    *enabled = false;
+                    return Err(error.into());
+                }
+            };
+        if encoder.field_section_is_blocked(required_insert_count) {
+            // Keep the insertions, but remove this unsent section's references.
+            // Only a fresh request stream is safe here: cancel_stream releases
+            // every tracked section on the stream, not just the latest one.
+            if let Err(error) = encoder.cancel_stream(stream_id.into_inner()) {
+                block.truncate(block_start);
+                pending.clear();
+                *enabled = false;
+                return Err(error.into());
+            }
+            block.truncate(block_start);
+            if let Err(error) = encode_stateless(block, fields) {
+                pending.clear();
+                *enabled = false;
+                return Err(error.into());
+            }
+        }
+        Ok(!pending.is_empty())
+    }
+
+    /// Transfers the next instruction batch to the connection driver.
+    ///
+    /// Returns `None` when no new output is queued, otherwise a non-empty batch.
+    /// The sole driver must finish and drop the previous batch before taking
+    /// another. Across [`Poll::Pending`], it must retain any unsent suffix.
+    /// Dropping a consumed batch releases its shared storage reference. Taking
+    /// a batch releases the mutex before I/O and allows request tasks to queue
+    /// the next batch.
+    /// The returned bytes remain committed, non-retractable encoder-stream
+    /// output; taking them is not evidence that the peer has received them.
+    ///
+    /// Returns an error if the encoder mutex is poisoned.
+    pub(crate) fn take_pending_instructions(&self) -> Result<Option<Bytes>, QpackEncoderError> {
+        let mut state = self.lock()?;
+        // Even an empty split can share the allocation and prevent the queue
+        // from reclaiming its consumed prefix. Do not create that extra handle.
+        if state.pending.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(state.pending.split().freeze()))
+    }
+
+    /// Applies complete instructions from the peer's QPACK decoder stream.
+    ///
+    /// `read.clone()` must provide an independent cursor over the same buffered
+    /// bytes. A trailing partial instruction stays unread for the next call;
+    /// complete instructions advance reference tracking and Known Received Count.
+    ///
+    /// Invalid feedback is a peer QPACK decoder-stream error; a poisoned mutex
+    /// is a local error. Earlier applied instructions are not rolled back on
+    /// failure, and the driver must close the connection in either case.
+    ///
+    /// See [RFC 9204, Section 4.4](https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4).
+    pub(crate) fn on_decoder_recv_buffered<R: Buf + Clone>(
+        &self,
+        read: &mut R,
+    ) -> Result<(), QpackEncoderError> {
+        self.lock()?.encoder.on_decoder_recv_buffered(read)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_acknowledged_all_insertions(&self) -> Result<bool, QpackEncoderError> {
+        Ok(self.lock()?.encoder.has_acknowledged_all_insertions())
+    }
 }
 
 impl std::error::Error for Error {}
@@ -184,6 +421,7 @@ impl BlockedStreamRegistry {
 struct QpackDecoderInner {
     decoder: RwLock<Decoder>,
     decoder_dynamic_table: bool,
+    allows_blocking: bool,
     max_encoded_string_size: usize,
     decoder_events_send: mpsc::UnboundedSender<QpackEvent>,
     /// Connection-driver waker used while a request holds a read guard.
@@ -210,6 +448,7 @@ impl QpackDecoder {
     ) -> Self {
         QpackDecoder(Arc::new(QpackDecoderInner {
             decoder_dynamic_table: decoder.dynamic_table_enabled(),
+            allows_blocking: decoder.max_blocked_streams() != 0,
             max_encoded_string_size: decoder.max_encoded_string_size(),
             decoder: RwLock::new(decoder),
             decoder_events_send,
@@ -243,6 +482,13 @@ impl QpackDecoder {
         required_ref: usize,
         waker: &Waker,
     ) -> Result<(), DecoderError> {
+        // A zero advertised limit leaves no legal blocked field section to
+        // register. Reject it synchronously; this also avoids waiting for a
+        // connection driver while a sequential server resolves the request.
+        if !self.0.allows_blocking {
+            return Err(DecoderError::TooManyBlockedStreams);
+        }
+
         self.0
             .decoder_events_send
             .send(QpackEvent::RegisterBlocked {
@@ -250,7 +496,7 @@ impl QpackDecoder {
                 required_ref,
                 waker: waker.clone(),
             })
-            .map_err(|_| DecoderError::UnexpectedEnd)?;
+            .map_err(|_| DecoderError::Internal("QPACK decoder event channel is closed"))?;
         #[cfg(feature = "tracing")]
         tracing::debug!(
             stream_id = ?stream_id,
@@ -300,7 +546,7 @@ impl QpackDecoder {
         self.0
             .decoder_events_send
             .send(QpackEvent::HeaderAck(stream_id))
-            .map_err(|_| DecoderError::UnexpectedEnd)?;
+            .map_err(|_| DecoderError::Internal("QPACK decoder event channel is closed"))?;
         #[cfg(feature = "tracing")]
         tracing::debug!(
             stream_id = ?stream_id,
@@ -347,7 +593,11 @@ impl QpackDecoder {
         match self.0.decoder.try_write() {
             Ok(mut decoder) => return Poll::Ready(decoder.on_encoder_recv_buffered(read, write)),
             Err(TryLockError::WouldBlock) => {}
-            _ => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+            _ => {
+                return Poll::Ready(Err(DecoderError::Internal(
+                    "QPACK decoder lock is poisoned",
+                )));
+            }
         }
 
         // The last reader may finish between the first attempt and registration.
@@ -356,7 +606,9 @@ impl QpackDecoder {
         match self.0.decoder.try_write() {
             Ok(mut decoder) => Poll::Ready(decoder.on_encoder_recv_buffered(read, write)),
             Err(TryLockError::WouldBlock) => Poll::Pending,
-            _ => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+            _ => Poll::Ready(Err(DecoderError::Internal(
+                "QPACK decoder lock is poisoned",
+            ))),
         }
     }
 
@@ -404,7 +656,11 @@ impl QpackDecoder {
                 return self.finish_decode(decoder, decoded);
             }
             Err(TryLockError::WouldBlock) => {}
-            _ => return Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+            _ => {
+                return Poll::Ready(Err(DecoderError::Internal(
+                    "QPACK decoder lock is poisoned",
+                )));
+            }
         }
 
         // Register before retrying; the writer drains this queue after its update.
@@ -414,7 +670,9 @@ impl QpackDecoder {
             .send(QpackEvent::DecoderAccessWaker(cx.waker().clone()))
             .is_err()
         {
-            return Poll::Ready(Err(DecoderError::UnexpectedEnd));
+            return Poll::Ready(Err(DecoderError::Internal(
+                "QPACK decoder event channel is closed",
+            )));
         }
         #[cfg(feature = "tracing")]
         tracing::debug!("queued QPACK decoder waiter for decoder write lock");
@@ -426,7 +684,96 @@ impl QpackDecoder {
                 self.finish_decode(decoder, decoded)
             }
             Err(TryLockError::WouldBlock) => Poll::Pending,
-            _ => Poll::Ready(Err(DecoderError::UnexpectedEnd)),
+            _ => Poll::Ready(Err(DecoderError::Internal(
+                "QPACK decoder lock is poisoned",
+            ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod shared_encoder_tests {
+    use std::io::Cursor;
+
+    use bytes::BytesMut;
+
+    use super::{
+        HeaderField, QpackEncoder,
+        block::HeaderPrefix,
+        stream::{DynamicTableSizeUpdate, InsertCountIncrement},
+    };
+    use crate::quic::StreamId;
+
+    #[test]
+    fn dynamic_encoder_waits_for_settings_instructions_to_drain() {
+        let encoder = QpackEncoder::default();
+        assert!(encoder.take_pending_instructions().unwrap().is_none());
+        encoder.configure(256, 256).unwrap();
+
+        let mut stateless = BytesMut::new();
+        encoder
+            .encode(
+                StreamId(0),
+                &mut stateless,
+                [HeaderField::borrowed(b"custom", b"value", false)],
+            )
+            .unwrap();
+        assert_eq!(
+            HeaderPrefix::decode(&mut Cursor::new(stateless.freeze()))
+                .unwrap()
+                .get(0, 0),
+            Ok((0, 0))
+        );
+
+        let capacity = encoder.lock().unwrap().pending.capacity();
+        let mut instructions = Cursor::new(encoder.take_pending_instructions().unwrap().unwrap());
+        assert_eq!(
+            DynamicTableSizeUpdate::decode(&mut instructions),
+            Ok(Some(DynamicTableSizeUpdate(256)))
+        );
+        assert!(encoder.take_pending_instructions().unwrap().is_none());
+        // Taking an empty queue must not keep an extra shared view alive after
+        // the driver releases its batch, otherwise this prefix is not reusable.
+        drop(instructions);
+        assert!(encoder.lock().unwrap().pending.try_reclaim(capacity));
+
+        let mut prewarm = BytesMut::new();
+        let encoder_instructions_queued = encoder
+            .encode(
+                StreamId(0),
+                &mut prewarm,
+                [HeaderField::borrowed(b"custom", b"value", false)],
+            )
+            .unwrap();
+        assert!(encoder_instructions_queued);
+        assert_eq!(
+            HeaderPrefix::decode(&mut Cursor::new(prewarm.freeze()))
+                .unwrap()
+                .get(0, 256),
+            Ok((0, 0))
+        );
+
+        let _instructions = encoder.take_pending_instructions().unwrap().unwrap();
+        let mut increment = Vec::new();
+        InsertCountIncrement(1).encode(&mut increment);
+        encoder
+            .on_decoder_recv_buffered(&mut Cursor::new(increment))
+            .unwrap();
+
+        let mut dynamic = BytesMut::new();
+        let encoder_instructions_queued = encoder
+            .encode(
+                StreamId(4),
+                &mut dynamic,
+                [HeaderField::borrowed(b"custom", b"value", false)],
+            )
+            .unwrap();
+        assert!(!encoder_instructions_queued);
+        assert_eq!(
+            HeaderPrefix::decode(&mut Cursor::new(dynamic.freeze()))
+                .unwrap()
+                .get(1, 256),
+            Ok((1, 1))
+        );
     }
 }

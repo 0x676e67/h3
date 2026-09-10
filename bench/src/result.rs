@@ -10,11 +10,67 @@ use super::{
     headers::{REQUEST_HEADERS, RESPONSE_HEADERS},
 };
 
-// v12 uses fixed browser-shaped fields; v11 measured repeated request-only fields.
-pub(crate) const RESULT_SCHEMA: &str = "http3-client-bench-v12";
+// v15 includes per-batch bookkeeping and normal request task/loop completion.
+pub(crate) const RESULT_SCHEMA: &str = "http3-client-bench-v15";
 
 /// Timed region shared by every Client implementation.
-pub const MEASUREMENT_PROFILE: &str = "post-local-setup-to-last-complete-response";
+pub const MEASUREMENT_PROFILE: &str = "connect-to-batch-complete";
+
+/// Server-side wire counters, reported after the measured Client batches.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerResult {
+    pub schema: String,
+    pub requests: u64,
+    pub request_dynamic_sections: u64,
+    pub response_dynamic_sections: u64,
+}
+
+impl ServerResult {
+    pub fn validate(&self, case: Case, expected_requests: u64) -> Result<()> {
+        check_eq("server schema", &self.schema, "http3-server-bench-v1")?;
+        if self.requests != expected_requests {
+            bail!(
+                "Server completed {} requests; expected {expected_requests}",
+                self.requests
+            );
+        }
+        for (name, count, enabled, headers) in [
+            (
+                "request",
+                self.request_dynamic_sections,
+                case.qpack.request,
+                case.headers.request,
+            ),
+            (
+                "response",
+                self.response_dynamic_sections,
+                case.qpack.response,
+                case.headers.response,
+            ),
+        ] {
+            if count > self.requests || (!enabled && count != 0) {
+                bail!("Server reported {count} invalid {name} dynamic field sections");
+            }
+            // Enabling a table is not proof of its use. Require a real reference
+            // for repeated non-static fixtures with enough rounds to process
+            // SETTINGS and insertion feedback. Tiny or single-wave batches
+            // and static-only fields can legitimately make no dynamic reference.
+            if enabled
+                && headers
+                && case.requests >= 32
+                && case.requests / case.in_flight >= 4
+                && count == 0
+            {
+                bail!(
+                    "qpack={} selected but no {name} dynamic reference was observed",
+                    case.qpack
+                );
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -24,6 +80,7 @@ pub struct ClientResult {
     pub(crate) quic_backend: String,
     pub(crate) transport_profile: String,
     pub(crate) measurement_profile: String,
+    pub(crate) qpack: String,
     pub(crate) requests: usize,
     pub(crate) in_flight: usize,
     pub(crate) request_headers: usize,
@@ -70,6 +127,7 @@ impl ClientResult {
             &self.measurement_profile,
             MEASUREMENT_PROFILE,
         )?;
+        check_eq("qpack", &self.qpack, &case.qpack.to_string())?;
         check_number("requests", self.requests, case.requests)?;
         check_number("in_flight", self.in_flight, case.in_flight)?;
         check_number(

@@ -1,10 +1,10 @@
 use std::{
     convert::TryFrom,
+    future::poll_fn,
     task::{Context, Poll},
 };
 
 use bytes::Buf;
-use futures_util::future;
 use http::{HeaderMap, Response};
 use quic::StreamId;
 #[cfg(feature = "tracing")]
@@ -99,7 +99,7 @@ where
     /// [`recv_data()`]: #method.recv_data
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_response(&mut self) -> Result<Response<()>, StreamError> {
-        let frame = future::poll_fn(|cx| self.inner.stream.poll_next(cx))
+        let frame = poll_fn(|cx| self.inner.stream.poll_next(cx))
             .await
             .map_err(|e| self.inner.handle_receive_stream_error(e))?
             .ok_or_else(|| {
@@ -140,29 +140,33 @@ where
             }
         };
 
-        let decode_result =
-            future::poll_fn(|cx| self.inner.poll_decode_field_section(cx, &mut encoded)).await;
-        let decoded = match decode_result {
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
-            //# An HTTP/3 implementation MAY impose a limit on the maximum size of
-            //# the message header it will accept on an individual HTTP message.
-            Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
-                self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
-                return Err(StreamError::HeaderTooBig {
-                    actual_size: cancel_size,
-                    max_size: self.inner.max_field_section_size,
-                });
-            }
-            Ok(decoded) => decoded,
-            Err(_e) => {
-                return Err(
-                    self.handle_connection_error_on_stream(InternalConnectionError {
-                        code: Code::QPACK_DECOMPRESSION_FAILED,
-                        message: "Failed to decode headers".to_string(),
-                    }),
-                );
-            }
-        };
+        let decoded =
+            match poll_fn(|cx| self.inner.poll_decode_field_section(cx, &mut encoded)).await {
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+                //# An HTTP/3 implementation MAY impose a limit on the maximum size of
+                //# the message header it will accept on an individual HTTP message.
+                Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
+                    self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
+                    return Err(StreamError::HeaderTooBig {
+                        actual_size: cancel_size,
+                        max_size: self.inner.max_field_section_size,
+                    });
+                }
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    let code = if error.is_internal() {
+                        Code::H3_INTERNAL_ERROR
+                    } else {
+                        Code::QPACK_DECOMPRESSION_FAILED
+                    };
+                    return Err(self.handle_connection_error_on_stream(
+                        InternalConnectionError::new(
+                            code,
+                            format!("failed to decode response headers: {error}"),
+                        ),
+                    ));
+                }
+            };
 
         let qpack::Decoded { fields, .. } = decoded;
 
@@ -182,6 +186,7 @@ where
                     reason: "Received malformed header".to_string(),
                 }
             })?;
+
         let mut resp = Response::new(());
         *resp.status_mut() = status;
         *resp.headers_mut() = headers;
@@ -197,7 +202,7 @@ where
     // TODO what if called before recv_response ?
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_data(&mut self) -> Result<Option<impl Buf + use<S, B>>, StreamError> {
-        future::poll_fn(|cx| self.poll_recv_data(cx)).await
+        poll_fn(|cx| self.poll_recv_data(cx)).await
     }
 
     /// Receive request body
@@ -211,7 +216,7 @@ where
     /// Receive an optional set of trailers for the response.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_trailers(&mut self) -> Result<Option<HeaderMap>, StreamError> {
-        future::poll_fn(|cx| self.poll_recv_trailers(cx)).await
+        poll_fn(|cx| self.poll_recv_trailers(cx)).await
     }
 
     /// Poll receive an optional set of trailers for the response.
