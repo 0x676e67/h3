@@ -354,7 +354,10 @@ impl<'a> Iterator for HeaderIter<'a> {
 impl TryFrom<Vec<HeaderField<'static>>> for Header {
     type Error = HeaderError;
     fn try_from(headers: Vec<HeaderField<'static>>) -> Result<Self, Self::Error> {
-        let mut fields = HeaderMap::with_capacity(headers.len());
+        // The decoded field count is peer-controlled, and a valid QPACK block
+        // can exceed HeaderMap's capacity even within the compressed-size limit.
+        let mut fields =
+            HeaderMap::try_with_capacity(headers.len()).map_err(|_| HeaderError::TooManyFields)?;
         let mut pseudo = Pseudo::default();
 
         for field in headers.into_iter() {
@@ -388,7 +391,9 @@ impl TryFrom<Vec<HeaderField<'static>>> for Header {
                 }
                 Field::Header((n, mut v)) => {
                     v.set_sensitive(sensitive);
-                    fields.append(n, v);
+                    fields
+                        .try_append(n, v)
+                        .map_err(|_| HeaderError::TooManyFields)?;
                 }
                 Field::Protocol(p) => {
                     pseudo.protocol = Some(p);
@@ -646,6 +651,8 @@ impl Pseudo {
 
 #[derive(Debug)]
 pub enum HeaderError {
+    /// The decoded field section exceeds the local HeaderMap capacity.
+    TooManyFields,
     InvalidHeaderName(String),
     InvalidHeaderValue(String),
     InvalidRequest(http::Error),
@@ -656,6 +663,19 @@ pub enum HeaderError {
 }
 
 impl HeaderError {
+    /// Returns the stream rejection code for a received field section.
+    ///
+    /// Container capacity is a local resource limit, not malformed QPACK or
+    /// HTTP syntax. Reject only this message; other streams can still proceed.
+    /// See [RFC 9114 Section 8.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-8.1)
+    /// and [Section 10.5.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-10.5.1).
+    pub(crate) fn code(&self) -> crate::error::Code {
+        match self {
+            Self::TooManyFields => crate::error::Code::H3_EXCESSIVE_LOAD,
+            _ => crate::error::Code::H3_MESSAGE_ERROR,
+        }
+    }
+
     fn invalid_name<N>(name: N) -> Self
     where
         N: AsRef<[u8]>,
@@ -681,6 +701,7 @@ impl std::error::Error for HeaderError {}
 impl fmt::Display for HeaderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            HeaderError::TooManyFields => write!(f, "field section exceeds local header capacity"),
             HeaderError::InvalidHeaderName(h) => write!(f, "invalid header name: {}", h),
             HeaderError::InvalidHeaderValue(v) => write!(f, "invalid header value: {}", v),
             HeaderError::InvalidRequest(r) => write!(f, "invalid request: {}", r),
@@ -699,6 +720,38 @@ mod tests {
     use assert_matches::assert_matches;
 
     use super::*;
+
+    #[test]
+    fn oversized_decoded_field_count_is_a_resource_error() {
+        // Repeated regular fields are valid and compress to a small block; the
+        // limit must be handled even with the default field-section settings.
+        let fields = vec![HeaderField::new("accept", "*/*"); 40_000];
+        let mut encoded = bytes::BytesMut::new();
+        crate::qpack::encode_stateless(&mut encoded, &fields).unwrap();
+        assert!(encoded.len() < crate::config::DEFAULT_QPACK_DECODE_BUFFER_SIZE);
+        let decoded = crate::qpack::Decoder::new(0, 0)
+            .unwrap()
+            .decode_header(&mut encoded)
+            .unwrap();
+        let error = Header::try_from(decoded.fields).unwrap_err();
+        assert_matches!(error, HeaderError::TooManyFields);
+        assert_eq!(error.code(), crate::error::Code::H3_EXCESSIVE_LOAD);
+    }
+
+    #[test]
+    fn regular_duplicate_fields_and_sensitivity_are_preserved() {
+        let mut field = HeaderField::new("set-cookie", "a=b");
+        field.sensitive = true;
+        let header = Header::try_from(vec![field; 128]).unwrap();
+        assert_eq!(header.fields.len(), 128);
+        assert!(
+            header
+                .fields
+                .get_all("set-cookie")
+                .iter()
+                .all(HeaderValue::is_sensitive)
+        );
+    }
 
     #[test]
     fn request_has_no_authority_nor_host() {

@@ -1875,11 +1875,12 @@ where
 
         Poll::Ready(Ok(Some(
             Header::try_from(fields)
-                .map_err(|_e| {
-                    self.stop_sending(Code::H3_MESSAGE_ERROR);
+                .map_err(|error| {
+                    let code = error.code();
+                    self.stop_sending(code);
                     StreamError::StreamError {
-                        code: Code::H3_MESSAGE_ERROR,
-                        reason: "malformed request".to_string(),
+                        code,
+                        reason: format!("rejected trailers: {error}"),
                     }
                 })?
                 .into_fields(),
