@@ -2046,14 +2046,15 @@ where
         };
         Poll::Ready(Ok(Some(
             Header::try_from(decoded.fields)
-                .map_err(|_| {
-                    self.stop_sending(Code::H3_MESSAGE_ERROR);
+                .and_then(Header::into_trailers)
+                .map_err(|error| {
+                    let code = error.code();
+                    self.stop_sending(code);
                     StreamError::StreamError {
-                        code: Code::H3_MESSAGE_ERROR,
-                        reason: "malformed trailers".to_string(),
+                        code,
+                        reason: format!("rejected trailers: {error}"),
                     }
-                })?
-                .into_fields(),
+                })?,
         )))
     }
 
@@ -2347,6 +2348,92 @@ mod qpack_field_section_tests {
             ));
         }
         assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn fragmented_dynamic_trailers_validate_after_one_acknowledgment() {
+        struct Recv(mpsc::UnboundedReceiver<Bytes>);
+
+        impl quic::RecvStream for Recv {
+            type Buf = Bytes;
+
+            fn poll_data(
+                &mut self,
+                cx: &mut Context<'_>,
+            ) -> Poll<Result<Option<Bytes>, StreamErrorIncoming>> {
+                self.0.poll_recv(cx).map(Ok)
+            }
+
+            fn stop_sending(&mut self, code: u64) {
+                assert_eq!(code, Code::H3_MESSAGE_ERROR.value());
+            }
+
+            fn recv_id(&self) -> StreamId {
+                StreamId(0)
+            }
+        }
+
+        for name in ["x-trailer", ":status"] {
+            let mut decoder = qpack::Decoder::new(1024, 1).unwrap();
+            let mut instructions = Vec::new();
+            qpack::DynamicTableSizeUpdate(1024).encode(&mut instructions);
+            qpack::InsertWithoutNameRef::new(name, "200")
+                .encode(&mut instructions)
+                .unwrap();
+            decoder
+                .on_encoder_recv(&mut instructions.as_slice(), &mut Vec::new())
+                .unwrap();
+            let (events_send, mut events) = mpsc::unbounded_channel();
+            let decoder = QpackDecoder::new(decoder, events_send);
+            let (send, recv) = mpsc::unbounded_channel();
+            let shared = Arc::new(SharedState::default());
+            let mut stream: RequestStream<_, Bytes> = RequestStream::new(
+                FrameStream::new(BufRecvStream::new(Recv(recv))),
+                u64::MAX,
+                1024,
+                shared.clone(),
+                false,
+                Some(decoder),
+            );
+            let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+
+            // HEADERS length 3, then RIC 1, Base 1 and relative index 0,
+            // delivered separately so the complete-block fast path cannot apply.
+            send.send(Bytes::from_static(&[1, 3])).unwrap();
+            for byte in [2, 0] {
+                send.send(Bytes::from(vec![byte])).unwrap();
+                assert!(stream.poll_recv_trailers(&mut cx).is_pending());
+                assert!(events.try_recv().is_err());
+            }
+            send.send(Bytes::from_static(&[0x80])).unwrap();
+            assert!(stream.poll_recv_trailers(&mut cx).is_pending());
+            assert!(matches!(stream.trailers, Some(TrailersState::Decoded(_))));
+            // QPACK completion precedes HTTP validation; even a pseudo-header
+            // must be acknowledged once, not again on each poll waiting for FIN.
+            // https://www.rfc-editor.org/rfc/rfc9204.html#section-4.4.1
+            assert!(matches!(
+                events.try_recv(),
+                Ok(QpackEvent::HeaderAck(StreamId(0)))
+            ));
+            for _ in 0..2 {
+                assert!(stream.poll_recv_trailers(&mut cx).is_pending());
+                assert!(events.try_recv().is_err());
+            }
+
+            drop(send);
+            match stream.poll_recv_trailers(&mut cx) {
+                Poll::Ready(Ok(Some(fields))) if name == "x-trailer" => {
+                    assert_eq!(fields["x-trailer"], "200");
+                }
+                Poll::Ready(Err(StreamError::StreamError { code, .. })) if name == ":status" => {
+                    assert_eq!(code, Code::H3_MESSAGE_ERROR);
+                }
+                result => panic!("unexpected trailer result: {result:?}"),
+            }
+            drop(stream);
+            assert!(events.try_recv().is_err());
+            assert!(shared.get_conn_error().is_none());
+        }
     }
 
     #[test]

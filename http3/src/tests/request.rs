@@ -25,6 +25,175 @@ use crate::{
     tests::get_stream_blocking,
 };
 
+async fn rejected_response_fields(
+    fields: Vec<qpack::HeaderField<'static>>,
+    trailers: bool,
+    code: Code,
+) {
+    let mut pair = Pair::default();
+    let endpoint = pair.server_inner();
+    let client_fut = async {
+        let (mut driver, mut client) = client::new(pair.client().await).await.unwrap();
+        let requests = async {
+            let mut stream = client
+                .send_request(Request::get("https://localhost/").body(()).unwrap())
+                .await
+                .unwrap();
+            stream.finish().await.unwrap();
+            let error = if trailers {
+                stream.recv_response().await.unwrap();
+                stream.recv_trailers().await.unwrap_err()
+            } else {
+                stream.recv_response().await.unwrap_err()
+            };
+            assert_matches!(error, StreamError::StreamError { code: actual, .. } if actual == code);
+            // A field-section rejection must leave the connection usable.
+            let mut next = client
+                .send_request(Request::get("https://localhost/").body(()).unwrap())
+                .await
+                .unwrap();
+            next.finish().await.unwrap();
+            assert_eq!(next.recv_response().await.unwrap().status(), StatusCode::OK);
+        };
+        tokio::select! {
+            biased;
+            _ = requests => (),
+            error = future::poll_fn(|cx| driver.poll_close(cx)) => panic!("connection failed: {error:?}"),
+        }
+    };
+    let peer = async {
+        let connection = endpoint.accept().await.unwrap().await.unwrap();
+        let mut control = connection.open_uni().await.unwrap();
+        let mut bytes = BytesMut::new();
+        StreamType::CONTROL.encode(&mut bytes);
+        Frame::<Bytes>::Settings(frame::Settings::default()).encode(&mut bytes);
+        control.write_all(&bytes).await.unwrap();
+        let (mut send, _recv) = connection.accept_bi().await.unwrap();
+        bytes.clear();
+        if trailers {
+            Frame::headers(vec![0, 0, 0xd9]).encode_with_payload(&mut bytes);
+        }
+        let mut block = BytesMut::new();
+        qpack::encode_stateless(&mut block, &fields).unwrap();
+        Frame::headers(block.to_vec()).encode_with_payload(&mut bytes);
+        send.write_all(&bytes).await.unwrap();
+        if trailers {
+            send.finish().unwrap();
+        } else {
+            assert_eq!(
+                send.stopped().await.unwrap().unwrap().into_inner(),
+                code.value()
+            );
+        }
+        let (mut next, _recv) = connection.accept_bi().await.unwrap();
+        bytes.clear();
+        Frame::headers(vec![0, 0, 0xd9]).encode_with_payload(&mut bytes);
+        next.write_all(&bytes).await.unwrap();
+        next.finish().unwrap();
+        let _ = connection.closed().await;
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(client_fut, peer);
+    })
+    .await
+    .unwrap();
+}
+
+async fn rejected_request_fields(
+    fields: Vec<qpack::HeaderField<'static>>,
+    trailers: bool,
+    code: Code,
+) {
+    let mut pair = Pair::default();
+    let mut endpoint = pair.server();
+    let (rejected_tx, rejected_rx) = tokio::sync::oneshot::channel();
+    let server_fut = async {
+        let mut incoming = server::Connection::new(endpoint.next().await)
+            .await
+            .unwrap();
+        let resolver = incoming.accept().await.unwrap().unwrap();
+        let error = if trailers {
+            let (_, mut stream) = resolver.resolve_request().await.unwrap();
+            stream.recv_trailers().await.unwrap_err()
+        } else {
+            resolver.resolve_request().await.err().unwrap()
+        };
+        assert_matches!(error, StreamError::StreamError { code: actual, .. } if actual == code);
+        rejected_tx.send(()).unwrap();
+        let (_, mut stream) = get_stream_blocking(&mut incoming).await.unwrap();
+        stream.send_response(Response::new(())).await.unwrap();
+        stream.finish().await.unwrap();
+        let _ = incoming.accept().await;
+    };
+    let peer = async {
+        let connection = pair.client_inner().await;
+        let mut control = connection.open_uni().await.unwrap();
+        let mut bytes = BytesMut::new();
+        StreamType::CONTROL.encode(&mut bytes);
+        Frame::<Bytes>::Settings(frame::Settings::default()).encode(&mut bytes);
+        control.write_all(&bytes).await.unwrap();
+        let mut valid = BytesMut::new();
+        qpack::encode_stateless(
+            &mut valid,
+            &Header::request(
+                http::Method::GET,
+                "https://localhost/".parse().unwrap(),
+                HeaderMap::new(),
+                http::Extensions::new(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        bytes.clear();
+        if trailers {
+            Frame::headers(valid.to_vec()).encode_with_payload(&mut bytes);
+        }
+        let mut block = BytesMut::new();
+        qpack::encode_stateless(&mut block, &fields).unwrap();
+        Frame::headers(block.to_vec()).encode_with_payload(&mut bytes);
+        send.write_all(&bytes).await.unwrap();
+        send.finish().unwrap();
+        if !trailers {
+            assert_matches!(recv.read_to_end(1024).await, Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(actual))) if actual.into_inner() == code.value());
+        }
+        rejected_rx.await.unwrap();
+        let (mut next_send, mut next_recv) = connection.open_bi().await.unwrap();
+        bytes.clear();
+        Frame::headers(valid.to_vec()).encode_with_payload(&mut bytes);
+        next_send.write_all(&bytes).await.unwrap();
+        next_send.finish().unwrap();
+        assert!(!next_recv.read_to_end(1024).await.unwrap().is_empty());
+        connection.close(quinn::VarInt::from_u32(0x100), b"done");
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(server_fut, peer);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn invalid_pseudo_fields_reject_only_the_affected_stream() {
+    for trailers in [false, true] {
+        let fields = vec![
+            qpack::HeaderField::new(":status", "200"),
+            qpack::HeaderField::new(":method", "GET"),
+        ];
+        rejected_response_fields(fields.clone(), trailers, Code::H3_MESSAGE_ERROR).await;
+        rejected_request_fields(fields, trailers, Code::H3_MESSAGE_ERROR).await;
+    }
+}
+
+#[tokio::test]
+async fn excessive_field_count_rejects_only_the_affected_stream() {
+    for trailers in [false, true] {
+        let fields = vec![qpack::HeaderField::new("accept", "*/*"); 40_000];
+        rejected_response_fields(fields.clone(), trailers, Code::H3_EXCESSIVE_LOAD).await;
+        rejected_request_fields(fields, trailers, Code::H3_EXCESSIVE_LOAD).await;
+    }
+}
+
 #[tokio::test]
 async fn get() {
     init_tracing();

@@ -115,9 +115,13 @@ where
 
     /// Polls the next stream frame without buffering a HEADERS payload.
     ///
-    /// RFC 9114 defines HEADERS as an encoded field section. Returning its length
+    /// RFC 9114 defines HEADERS as an encoded field section. Tracking its length
     /// here lets QPACK consume the payload through `poll_data` as transport chunks
     /// arrive instead of waiting for the complete frame.
+    ///
+    /// Used for Client response headers and trailers in both roles. Server initial
+    /// request headers still use [`Self::poll_next`] and complete-block decoding,
+    /// preserving the resolver's existing `accept_with_frame` handoff.
     ///
     /// See [RFC 9114, Section 7.2.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-7.2.2).
     pub(crate) fn poll_next_frame(
