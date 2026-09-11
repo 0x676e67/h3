@@ -150,12 +150,11 @@ impl QpackEncoder {
             return Ok(());
         }
 
-        let mut state = self.lock()?;
         let QpackEncoderState {
             encoder,
             pending,
             enabled,
-        } = &mut *state;
+        } = &mut *self.lock()?;
         // Generate speculative insertions with one private slot, but transmit
         // only field sections whose Required Insert Count is already known by
         // the peer. The peer's blocked-stream allowance is therefore never

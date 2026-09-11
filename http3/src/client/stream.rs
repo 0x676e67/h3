@@ -109,9 +109,8 @@ where
         //# mismatch, it MUST respond with a connection error of type
         //# H3_GENERAL_PROTOCOL_ERROR.
 
-        let decoded = poll_fn(|cx| self.inner.poll_recv_response_headers(cx)).await?;
-
-        let qpack::Decoded { fields, .. } = decoded;
+        let qpack::Decoded { fields, .. } =
+            poll_fn(|cx| self.inner.poll_recv_response_headers(cx)).await?;
 
         let (status, headers, pseudo_sensitivity) = Header::try_from(fields)
             .and_then(Header::into_response_parts)
